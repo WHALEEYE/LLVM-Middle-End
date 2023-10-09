@@ -18,19 +18,9 @@ namespace
     std::map<Value *, std::set<CallInst *>> in, out;
   };
 
-  struct FuncRDAInfo
-  {
-    Function *F;
-    std::map<Instruction *, Sets *> inNOut;
-
-    FuncRDAInfo(Function *F) : F(F) {}
-  };
-
   struct CAT : public FunctionPass
   {
     static char ID;
-
-    std::set<FuncRDAInfo *> rdaInfo;
 
     CAT() : FunctionPass(ID) {}
 
@@ -42,50 +32,38 @@ namespace
       return false;
     }
 
-    bool RDAinBB(BasicBlock &BB, FuncRDAInfo *funcRDAInfo)
+    bool RDAinBB(BasicBlock &BB, std::map<Instruction *, Sets *> &inNOut)
     {
       Sets *sets = new Sets();
-      // create two temporary sets for comparing old IN and new IN
-      std::unordered_set<CallInst *> oldIn, newIn;
+      // create two temporary sets for comparing old OUT and new OUT
+      std::unordered_set<CallInst *> oldOut, newOut;
+      bool firstTime = true;
+
+      // if the block already have OUT, store it for further comparison
+      if (inNOut.find(BB.getTerminator()) != inNOut.end())
+      {
+        firstTime = false;
+        for (auto &pair : inNOut[BB.getTerminator()]->out)
+          for (auto *I : pair.second)
+            oldOut.insert(I);
+      }
 
       // merge all the predecessors' OUTs into IN of the current block
       if (!predecessors(&BB).empty())
         for (auto *PB : predecessors(&BB))
         {
           // if the predecessor is not analyzed yet, skip
-          if (funcRDAInfo->inNOut.find(PB->getTerminator()) == funcRDAInfo->inNOut.end())
+          if (inNOut.find(PB->getTerminator()) == inNOut.end())
             continue;
-          
-          auto *predSets = funcRDAInfo->inNOut[PB->getTerminator()];
+
+          auto *predSets = inNOut[PB->getTerminator()];
           for (auto &pair : predSets->out)
             for (auto *I : pair.second)
             {
               sets->in[pair.first].insert(I);
-              newIn.insert(I);
+              newOut.insert(I);
             }
         }
-
-      // if the block already have IN and it equals to the current IN, skip
-      if (funcRDAInfo->inNOut.find(&BB.front()) != funcRDAInfo->inNOut.end())
-      {
-        Sets *oldSets = funcRDAInfo->inNOut[&BB.front()];
-        for (auto &pair : oldSets->in)
-          for (auto *I : pair.second)
-            oldIn.insert(I);
-
-        if (oldIn.size() == newIn.size())
-        {
-          bool equal = true;
-          for (auto *I : oldIn)
-            if (newIn.find(I) == newIn.end())
-            {
-              equal = false;
-              break;
-            }
-          if (equal)
-            return false;
-        }
-      }
 
       // calculate OUT for each instruction the current block
       for (auto &I : BB)
@@ -112,20 +90,38 @@ namespace
             }
           }
         }
-        funcRDAInfo->inNOut[&I] = sets;
+        inNOut[&I] = sets;
         sets = new Sets();
-        sets->in = funcRDAInfo->inNOut[&I]->out;
+        sets->in = inNOut[&I]->out;
       }
-      return true;
+
+      // if the block is analyzed for the first time, then we need to add its successors to the queue
+      if (firstTime)
+        return true;
+
+      // the block is analyzed before, so we need to compare the old OUT with the new OUT
+      for (auto &pair : inNOut[BB.getTerminator()]->out)
+        for (auto *I : pair.second)
+          newOut.insert(I);
+
+      if (oldOut.size() != newOut.size())
+        return true;
+
+      for (auto *I : oldOut)
+        // found a difference, so the block is changed
+        if (newOut.find(I) == newOut.end())
+          return true;
+
+      // the block is not changed if the two sets are equal
+      return false;
     }
 
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction(Function &F) override
     {
+      std::map<Instruction *, Sets *> inNOut;
       std::queue<BasicBlock *> toBeAnalyzed;
-      FuncRDAInfo *funcRDAInfo = new FuncRDAInfo(&F);
-      rdaInfo.insert(funcRDAInfo);
 
       // initialize the queue with all the blocks without predecessors
       for (auto &B : F)
@@ -139,38 +135,28 @@ namespace
 
         // try to analyze the block
         // if the block is changed, add its successors to the queue
-        if (RDAinBB(*BB, funcRDAInfo))
+        if (RDAinBB(*BB, inNOut))
           for (auto *suc : successors(BB))
             toBeAnalyzed.push(suc);
       }
 
-      return false;
-    }
-
-    // invoke before ending the pass
-    bool doFinalization(Module &M) override
-    {
-      for (auto &FuncRDAInfo : rdaInfo)
+      errs() << "Function \"" << F.getName() << "\"\n";
+      for (auto &pair : inNOut)
       {
-        errs() << "Function \"" << FuncRDAInfo->F->getName() << "\"\n";
-        for (auto &pair : FuncRDAInfo->inNOut)
-        {
-          errs() << "INSTRUCTION:   " << *pair.first << "\n***************** IN\n{\n";
+        errs() << "INSTRUCTION:   " << *pair.first << "\n***************** IN\n{\n";
 
-          for (auto &defPair : pair.second->in)
-            for (auto *I : defPair.second)
-              errs() << *I << "\n";
+        for (auto &defPair : pair.second->in)
+          for (auto *I : defPair.second)
+            errs() << *I << "\n";
 
-          errs() << "}\n**************************************\n***************** OUT\n{\n";
+        errs() << "}\n**************************************\n***************** OUT\n{\n";
 
-          for (auto &defPair : pair.second->out)
-            for (auto *I : defPair.second)
-              errs() << *I << "\n";
+        for (auto &defPair : pair.second->out)
+          for (auto *I : defPair.second)
+            errs() << *I << "\n";
 
-          errs() << "}\n**************************************\n";
-        }
+        errs() << "}\n**************************************\n";
       }
-
       return false;
     }
 
