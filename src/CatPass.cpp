@@ -13,10 +13,8 @@ using namespace llvm;
 
 namespace
 {
-  struct Sets
-  {
-    std::map<Value *, std::set<CallInst *>> in, out;
-  };
+  typedef std::map<Value *, std::set<CallInst *>> RDASet;
+  typedef std::map<Instruction *, std::map<Value *, std::set<CallInst *>>> RDAMap;
 
   struct CAT : public FunctionPass
   {
@@ -32,18 +30,18 @@ namespace
       return false;
     }
 
-    bool RDAinBB(BasicBlock &BB, std::map<Instruction *, Sets *> &inNOut)
+    bool RDAinBB(BasicBlock &BB, RDAMap &IN, RDAMap &OUT)
     {
-      Sets *sets = new Sets();
+      RDASet curIN, curOUT;
       // create two temporary sets for comparing old OUT and new OUT
       std::unordered_set<CallInst *> oldOut, newOut;
       bool firstTime = true;
 
       // if the block already have OUT, store it for further comparison
-      if (inNOut.find(BB.getTerminator()) != inNOut.end())
+      if (OUT.find(BB.getTerminator()) != OUT.end())
       {
         firstTime = false;
-        for (auto &pair : inNOut[BB.getTerminator()]->out)
+        for (auto &pair : OUT[BB.getTerminator()])
           for (auto *I : pair.second)
             oldOut.insert(I);
       }
@@ -53,22 +51,19 @@ namespace
         for (auto *PB : predecessors(&BB))
         {
           // if the predecessor is not analyzed yet, skip
-          if (inNOut.find(PB->getTerminator()) == inNOut.end())
+          if (OUT.find(PB->getTerminator()) == OUT.end())
             continue;
 
-          auto *predSets = inNOut[PB->getTerminator()];
-          for (auto &pair : predSets->out)
+          for (auto &pair : OUT[PB->getTerminator()])
             for (auto *I : pair.second)
-            {
-              sets->in[pair.first].insert(I);
-              newOut.insert(I);
-            }
+              curIN[pair.first].insert(I);
         }
 
-      // calculate OUT for each instruction the current block
+      // calculate IN and OUT for each instruction in the current block
       for (auto &I : BB)
       {
-        sets->out = sets->in;
+        IN[&I] = curIN;
+        curOUT = curIN;
         if (isa<CallInst>(I))
         {
           auto *callInst = dyn_cast<CallInst>(&I);
@@ -79,20 +74,19 @@ namespace
             if (calledFunction->getName().equals("CAT_new"))
             {
               gen = callInst;
-              sets->out[gen] = std::set<CallInst *>();
-              sets->out[gen].insert(callInst);
+              curOUT[gen] = std::set<CallInst *>();
+              curOUT[gen].insert(callInst);
             }
             else if (calledFunction->getName().equals("CAT_add") || calledFunction->getName().equals("CAT_sub") || calledFunction->getName().equals("CAT_set"))
             {
               gen = callInst->getArgOperand(0);
-              sets->out[gen] = std::set<CallInst *>();
-              sets->out[gen].insert(callInst);
+              curOUT[gen] = std::set<CallInst *>();
+              curOUT[gen].insert(callInst);
             }
           }
         }
-        inNOut[&I] = sets;
-        sets = new Sets();
-        sets->in = inNOut[&I]->out;
+        OUT[&I] = curOUT;
+        curIN = curOUT;
       }
 
       // if the block is analyzed for the first time, then we need to add its successors to the queue
@@ -100,7 +94,7 @@ namespace
         return true;
 
       // the block is analyzed before, so we need to compare the old OUT with the new OUT
-      for (auto &pair : inNOut[BB.getTerminator()]->out)
+      for (auto &pair : OUT[BB.getTerminator()])
         for (auto *I : pair.second)
           newOut.insert(I);
 
@@ -120,7 +114,7 @@ namespace
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction(Function &F) override
     {
-      std::map<Instruction *, Sets *> inNOut;
+      RDAMap IN, OUT;
       std::queue<BasicBlock *> toBeAnalyzed;
 
       // initialize the queue with all the blocks without predecessors
@@ -135,23 +129,23 @@ namespace
 
         // try to analyze the block
         // if the block is changed, add its successors to the queue
-        if (RDAinBB(*BB, inNOut))
+        if (RDAinBB(*BB, IN, OUT))
           for (auto *suc : successors(BB))
             toBeAnalyzed.push(suc);
       }
 
       errs() << "Function \"" << F.getName() << "\"\n";
-      for (auto &pair : inNOut)
+      for (auto &pair : IN)
       {
         errs() << "INSTRUCTION:   " << *pair.first << "\n***************** IN\n{\n";
 
-        for (auto &defPair : pair.second->in)
+        for (auto &defPair : pair.second)
           for (auto *I : defPair.second)
             errs() << *I << "\n";
 
         errs() << "}\n**************************************\n***************** OUT\n{\n";
 
-        for (auto &defPair : pair.second->out)
+        for (auto &defPair : OUT[pair.first])
           for (auto *I : defPair.second)
             errs() << *I << "\n";
 
