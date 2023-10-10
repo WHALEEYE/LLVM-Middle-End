@@ -3,6 +3,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include <map>
 #include <set>
@@ -64,27 +65,25 @@ namespace
       {
         IN[&I] = curIN;
         curOUT = curIN;
-        if (isa<CallInst>(I))
+
+        if (auto *callInst = dyn_cast<CallInst>(&I))
         {
-          auto *callInst = dyn_cast<CallInst>(&I);
-          Function *calledFunction = callInst->getCalledFunction();
-          if (calledFunction)
+          Value *gen;
+          auto calledName = callInst->getCalledFunction()->getName();
+          if (calledName.equals("CAT_new"))
           {
-            Value *gen;
-            if (calledFunction->getName().equals("CAT_new"))
-            {
-              gen = callInst;
-              curOUT[gen] = std::set<CallInst *>();
-              curOUT[gen].insert(callInst);
-            }
-            else if (calledFunction->getName().equals("CAT_add") || calledFunction->getName().equals("CAT_sub") || calledFunction->getName().equals("CAT_set"))
-            {
-              gen = callInst->getArgOperand(0);
-              curOUT[gen] = std::set<CallInst *>();
-              curOUT[gen].insert(callInst);
-            }
+            gen = callInst;
+            curOUT[gen] = std::set<CallInst *>();
+            curOUT[gen].insert(callInst);
+          }
+          else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
+          {
+            gen = callInst->getArgOperand(0);
+            curOUT[gen] = std::set<CallInst *>();
+            curOUT[gen].insert(callInst);
           }
         }
+
         OUT[&I] = curOUT;
         curIN = curOUT;
       }
@@ -110,6 +109,125 @@ namespace
       return false;
     }
 
+    void printRDAResult(Function &F, RDAMap &IN, RDAMap &OUT)
+    {
+      errs() << "Function \"" << F.getName() << "\"\n";
+      for (auto &pair : IN)
+      {
+        errs() << "INSTRUCTION:   " << *pair.first << "\n***************** IN\n{\n";
+
+        for (auto &defPair : pair.second)
+          for (auto *I : defPair.second)
+            errs() << *I << "\n";
+
+        errs() << "}\n**************************************\n***************** OUT\n{\n";
+
+        for (auto &defPair : OUT[pair.first])
+          for (auto *I : defPair.second)
+            errs() << *I << "\n";
+
+        errs() << "}\n**************************************\n";
+      }
+    }
+
+    Value *getIfIsConstant(Value *operand, RDASet &curIN)
+    {
+      Value *constant = nullptr;
+      for (auto def : curIN[operand])
+      {
+        auto *callInst = cast<CallInst>(def);
+        auto calledName = callInst->getCalledFunction()->getName();
+        Value *newConstant;
+
+        if (calledName.equals("CAT_new"))
+          newConstant = callInst->getOperand(0);
+        else if (calledName.equals("CAT_set"))
+          newConstant = callInst->getOperand(1);
+        else
+          return nullptr;
+
+        if (!constant)
+          constant = newConstant;
+        else if (!isa<ConstantInt>(constant) || !isa<ConstantInt>(newConstant))
+          return nullptr;
+        else if (cast<ConstantInt>(constant)->getValue() == cast<ConstantInt>(newConstant)->getValue())
+          continue;
+        else
+          return nullptr;
+      }
+
+      return constant;
+    }
+
+    void constantFold(Function &F, RDAMap &IN)
+    {
+      std::vector<CallInst *> deleteList;
+      std::vector<Instruction *> instructions;
+      for (auto &B : F)
+        for (auto &I : B)
+          instructions.push_back(&I);
+
+      for (auto *I : instructions)
+      {
+        if (!isa<CallInst>(I))
+          continue;
+
+        auto *callInst = cast<CallInst>(I);
+        auto calledName = callInst->getCalledFunction()->getName();
+
+        if (!(calledName.equals("CAT_add") || calledName.equals("CAT_sub")))
+          continue;
+
+        // check if all the definitions of the operands that reach the call instruction are constant
+        auto op1 = callInst->getOperand(1);
+        auto op2 = callInst->getOperand(2);
+        auto *constant1 = getIfIsConstant(op1, IN[I]), *constant2 = getIfIsConstant(op2, IN[I]);
+        if (!constant1 || !constant2)
+          continue;
+
+        IRBuilder<> builder(callInst);
+
+        std::vector<Value *> args = {
+            callInst->getOperand(0),
+            calledName.equals("CAT_add") ? builder.CreateAdd(constant1, constant2) : builder.CreateSub(constant1, constant2)};
+
+        builder.CreateCall(F.getParent()->getFunction("CAT_set"), args);
+        deleteList.push_back(callInst);
+      }
+      for (auto *I : deleteList)
+        I->eraseFromParent();
+    }
+
+    void constantProp(Function &F, RDAMap &IN)
+    {
+      std::vector<CallInst *> deleteList;
+      std::vector<Instruction *> instructions;
+      for (auto &B : F)
+        for (auto &I : B)
+          instructions.push_back(&I);
+
+      for (auto *I : instructions)
+      {
+        if (!isa<CallInst>(I))
+          continue;
+        auto *callInst = cast<CallInst>(I);
+        auto calledName = callInst->getCalledFunction()->getName();
+
+        if (!calledName.equals("CAT_get"))
+          continue;
+
+        auto *constant = getIfIsConstant(callInst->getOperand(0), IN[I]);
+        if (!constant)
+          continue;
+
+        callInst->replaceAllUsesWith(constant);
+        deleteList.push_back(callInst);
+      }
+
+      for (auto I : deleteList)
+        I->eraseFromParent();
+    }
+
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction(Function &F) override
@@ -133,24 +251,10 @@ namespace
           for (auto *suc : successors(BB))
             toBeAnalyzed.push(suc);
       }
+      // printRDAResult(F, IN, OUT);
 
-      errs() << "Function \"" << F.getName() << "\"\n";
-      for (auto &pair : IN)
-      {
-        errs() << "INSTRUCTION:   " << *pair.first << "\n***************** IN\n{\n";
-
-        for (auto &defPair : pair.second)
-          for (auto *I : defPair.second)
-            errs() << *I << "\n";
-
-        errs() << "}\n**************************************\n***************** OUT\n{\n";
-
-        for (auto &defPair : OUT[pair.first])
-          for (auto *I : defPair.second)
-            errs() << *I << "\n";
-
-        errs() << "}\n**************************************\n";
-      }
+      constantFold(F, IN);
+      constantProp(F, IN);
       return false;
     }
 
