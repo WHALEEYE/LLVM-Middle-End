@@ -109,6 +109,27 @@ namespace
       return false;
     }
 
+    void printRDAResult(Function &F, RDAMap &IN, RDAMap &OUT)
+    {
+      errs() << "Function \"" << F.getName() << "\"\n";
+      for (auto &pair : IN)
+      {
+        errs() << "INSTRUCTION:   " << *pair.first << "\n***************** IN\n{\n";
+
+        for (auto &defPair : pair.second)
+          for (auto *I : defPair.second)
+            errs() << *I << "\n";
+
+        errs() << "}\n**************************************\n***************** OUT\n{\n";
+
+        for (auto &defPair : OUT[pair.first])
+          for (auto *I : defPair.second)
+            errs() << *I << "\n";
+
+        errs() << "}\n**************************************\n";
+      }
+    }
+
     Value *getIfIsConstant(Value *operand, RDASet &curIN)
     {
       Value *constant = nullptr;
@@ -230,6 +251,7 @@ namespace
           for (auto *suc : successors(BB))
             toBeAnalyzed.push(suc);
       }
+      // printRDAResult(F, IN, OUT);
 
       constantFold(F, IN);
       constantProp(F, IN);
