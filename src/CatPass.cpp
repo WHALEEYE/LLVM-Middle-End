@@ -16,6 +16,7 @@ namespace
 {
   typedef std::map<Value *, std::set<CallInst *>> RDASet;
   typedef std::map<Instruction *, std::map<Value *, std::set<CallInst *>>> RDAMap;
+  typedef std::map<CallInst *, bool> DCEMap;
 
   struct CAT : public FunctionPass
   {
@@ -228,6 +229,60 @@ namespace
         I->eraseFromParent();
     }
 
+    void deadCodeEli(Function &F, RDAMap &IN)
+    {
+      std::vector<CallInst *> deleteList;
+      std::vector<Instruction *> instructions;
+      DCEMap dceMap;
+      for (auto &B : F)
+        for (auto &I : B)
+        {
+          instructions.push_back(&I);
+          if (!isa<CallInst>(I))
+            continue;
+          auto *callInst = cast<CallInst>(&I);
+          auto calledName = callInst->getCalledFunction()->getName();
+          // register the call instruction if it is a CAT_add, CAT_sub or CAT_set, which may be deleted by DCE
+          // DCE won't eliminate CAT_new and CAT_get
+          if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
+            dceMap[callInst] = false;
+        }
+
+      for (auto *I : instructions)
+      {
+        // check dependencies of the call instruction if it's a CAT_add, CAT_sub or CAT_get
+        if (!isa<CallInst>(I))
+          continue;
+        auto *callInst = cast<CallInst>(I);
+        auto calledName = callInst->getCalledFunction()->getName();
+
+        if (calledName.equals("CAT_add") || calledName.equals("CAT_sub"))
+        {
+          auto *op1 = callInst->getOperand(1), *op2 = callInst->getOperand(2);
+          // mark the def of the operands (only ones registered in map) as alive
+          for (auto *def : IN[I][op1])
+            if (dceMap.find(def) != dceMap.end())
+              dceMap[def] = true;
+          for (auto *def : IN[I][op2])
+            if (dceMap.find(def) != dceMap.end())
+              dceMap[def] = true;
+        }
+        else if (calledName.equals("CAT_get"))
+        {
+          for (auto *def : IN[I][callInst->getOperand(0)])
+            if (dceMap.find(def) != dceMap.end())
+              dceMap[def] = true;
+        }
+        else
+          continue;
+      }
+
+      // delete the call instructions that are registered and marked as dead
+      for (auto &pair : dceMap)
+        if (!pair.second)
+          pair.first->eraseFromParent();
+    }
+
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction(Function &F) override
@@ -252,6 +307,9 @@ namespace
             toBeAnalyzed.push(suc);
       }
       // printRDAResult(F, IN, OUT);
+
+      // dead code elimination, must be done right after RDA
+      deadCodeEli(F, IN);
 
       constantFold(F, IN);
       constantProp(F, IN);
