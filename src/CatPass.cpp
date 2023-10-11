@@ -160,7 +160,7 @@ namespace
       return constant;
     }
 
-    void constantFold(Function &F, RDAMap &IN)
+    void constantFoldAndAlgSimp(Function &F, RDAMap &IN)
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
@@ -183,16 +183,24 @@ namespace
         auto op1 = callInst->getOperand(1);
         auto op2 = callInst->getOperand(2);
         auto *constant1 = getIfIsConstant(op1, IN[I]), *constant2 = getIfIsConstant(op2, IN[I]);
-        if (!constant1 || !constant2)
+        if (!constant1 && !constant2)
           continue;
 
         IRBuilder<> builder(callInst);
+        Value *newOperand;
+        // if both operands are constant, constant fold
+        if (constant1 && constant2)
+          newOperand = calledName.equals("CAT_add") ? builder.CreateAdd(constant1, constant2) : builder.CreateSub(constant1, constant2);
+        // if one of the operands is constant 0, then we can do the algebraic simplification
+        else if (!constant1 && isa<ConstantInt>(constant2) && cast<ConstantInt>(constant2)->getValue() == 0)
+          newOperand = builder.CreateCall(F.getParent()->getFunction("CAT_get"), std::vector<Value *>({op1}));
+        else if (!constant2 && isa<ConstantInt>(constant1) && cast<ConstantInt>(constant1)->getValue() == 0 && calledName.equals("CAT_add"))
+          // if the operation is CAT_sub and the second operand is not constant, then we can't simplify it because we need to do negation
+          newOperand = builder.CreateCall(F.getParent()->getFunction("CAT_get"), std::vector<Value *>({op2}));
+        else
+          continue;
 
-        std::vector<Value *> args = {
-            callInst->getOperand(0),
-            calledName.equals("CAT_add") ? builder.CreateAdd(constant1, constant2) : builder.CreateSub(constant1, constant2)};
-
-        builder.CreateCall(F.getParent()->getFunction("CAT_set"), args);
+        builder.CreateCall(F.getParent()->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), newOperand}));
         deleteList.push_back(callInst);
       }
       for (auto *I : deleteList)
@@ -311,7 +319,7 @@ namespace
       // dead code elimination, must be done right after RDA
       deadCodeEli(F, IN);
 
-      constantFold(F, IN);
+      constantFoldAndAlgSimp(F, IN);
       constantProp(F, IN);
       return false;
     }
