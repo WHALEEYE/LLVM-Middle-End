@@ -160,7 +160,7 @@ namespace
       return constant;
     }
 
-    void constantFoldAndAlgSimp(Function &F, RDAMap &IN)
+    bool constantFoldAndAlgSimp(Function &F, RDAMap &IN)
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
@@ -205,9 +205,11 @@ namespace
       }
       for (auto *I : deleteList)
         I->eraseFromParent();
+
+      return deleteList.size() > 0;
     }
 
-    void constantProp(Function &F, RDAMap &IN)
+    bool constantProp(Function &F, RDAMap &IN)
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
@@ -235,9 +237,11 @@ namespace
 
       for (auto I : deleteList)
         I->eraseFromParent();
+
+      return deleteList.size() > 0;
     }
 
-    void deadCodeEli(Function &F, RDAMap &IN)
+    bool deadCodeEli(Function &F, RDAMap &IN)
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
@@ -285,10 +289,15 @@ namespace
           continue;
       }
 
+      bool changed = false;
       // delete the call instructions that are registered and marked as dead
       for (auto &pair : dceMap)
         if (!pair.second)
+        {
+          changed = true;
           pair.first->eraseFromParent();
+        }
+      return changed;
     }
 
     // This function is invoked once per function compiled
@@ -316,12 +325,13 @@ namespace
       }
       // printRDAResult(F, IN, OUT);
 
+      bool changed = false;
       // dead code elimination, must be done right after RDA
-      deadCodeEli(F, IN);
+      changed |= deadCodeEli(F, IN);
 
-      constantFoldAndAlgSimp(F, IN);
-      constantProp(F, IN);
-      return false;
+      changed |= constantFoldAndAlgSimp(F, IN);
+      changed |= constantProp(F, IN);
+      return changed;
     }
 
     // We don't modify the program, so we preserve all analyses.
@@ -329,7 +339,7 @@ namespace
     void getAnalysisUsage(AnalysisUsage &AU) const override
     {
       // errs() << "Hello LLVM World at \"getAnalysisUsage\"\n" ;
-      AU.setPreservesAll();
+      AU.setPreservesCFG();
     }
   };
 }
