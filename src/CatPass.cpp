@@ -432,8 +432,8 @@ namespace
       // to avoid all CAT_set being eliminated by DCE (so the signature will also be killed)
       // we only do DCE when there is no further constant optimization
       // DCE will not bring new optimization points to fold and propagation
-      if (!changed)
-        changed |= deadCodeEli(F, IN);
+      // if (!changed)
+      //   changed |= deadCodeEli(F, IN);
 
       return changed;
     }
