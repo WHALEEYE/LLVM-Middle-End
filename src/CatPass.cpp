@@ -169,18 +169,13 @@ namespace
       }
     }
 
-    Value *walkPhi(PHINode *cur, RDASet &curIN, PHINode *root, bool first)
+    Value *walkPhi(PHINode *cur, RDASet &curIN, PHINode *root, std::unordered_set<PHINode*> seen)
     {
-      // errs() << "Walking PHI node: " << *cur << "\n";
-      // errs() << "Root: " << *root << "\n";
-      // errs() << "Detail: " << cur << " " << root << "\n";
 
       // if we found a circle of PHI nodes, return nullptr
-      if (!first && cur == root)
-      {
-        errs() << "Circle of PHI nodes detected\n";
+      if (seen.find(cur) != seen.end())
         return nullptr;
-      }
+      seen.insert(cur);
 
       Value *constant = nullptr;
       // check the incoming values of the phi node recursively
@@ -189,7 +184,7 @@ namespace
         Value *newConstant;
         if (auto *phiNode = dyn_cast<PHINode>(op))
           // if the incoming value is still a phi node, then we need to check it recursively
-          newConstant = walkPhi(phiNode, curIN, root, false);
+          newConstant = walkPhi(phiNode, curIN, root, seen);
         else
           // a regular definition, check if it's constant
           // note that we don't check the reaching definitions at the place of phi node
@@ -238,7 +233,7 @@ namespace
         {
           // def is a phi node
           auto *phiNode = cast<PHINode>(def);
-          newConstant = walkPhi(phiNode, curIN, phiNode, true);
+          newConstant = walkPhi(phiNode, curIN, phiNode, std::unordered_set<PHINode*>());
         }
 
         if (!newConstant)
