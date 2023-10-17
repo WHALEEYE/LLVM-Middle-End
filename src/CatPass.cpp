@@ -60,6 +60,16 @@ namespace
             for (auto *I : pair.second)
               curIN[pair.first].insert(I);
         }
+      else
+      {
+        // if the block has no predecessors, then it's the entry block
+        // initialize the IN of the entry block to the arguments
+        for (auto &arg : BB.getParent()->args())
+        {
+          curIN[&arg] = std::set<CallInst *>();
+          curIN[&arg].insert(nullptr);
+        }
+      }
 
       // calculate IN and OUT for each instruction in the current block
       for (auto &I : BB)
@@ -82,6 +92,16 @@ namespace
             gen = callInst->getArgOperand(0);
             curOUT[gen] = std::set<CallInst *>();
             curOUT[gen].insert(callInst);
+          }
+          else if (!calledName.equals("CAT_get") && !calledName.equals("CAT_destroy"))
+          {
+            // dealing with escaping variables, set all the parameters as gen
+            for (auto &op : callInst->operands())
+            {
+              gen = op.get();
+              curOUT[gen] = std::set<CallInst *>();
+              curOUT[gen].insert(callInst);
+            }
           }
         }
 
@@ -136,15 +156,19 @@ namespace
       Value *constant = nullptr;
       for (auto def : curIN[operand])
       {
-        auto *callInst = cast<CallInst>(def);
-        auto calledName = callInst->getCalledFunction()->getName();
+        // def may be nullptr, which means the operand is an argument
+        if (!def)
+          return nullptr;
+        
+        auto calledName = def->getCalledFunction()->getName();
         Value *newConstant;
 
         if (calledName.equals("CAT_new"))
-          newConstant = callInst->getOperand(0);
+          newConstant = def->getOperand(0);
         else if (calledName.equals("CAT_set"))
-          newConstant = callInst->getOperand(1);
+          newConstant = def->getOperand(1);
         else
+          // CAT_add, CAT_sub, or escaping variables
           return nullptr;
 
         if (!constant)
@@ -256,7 +280,8 @@ namespace
           auto calledName = callInst->getCalledFunction()->getName();
           // register the call instruction if it is a CAT_add, CAT_sub or CAT_set, which may be deleted by DCE
           // DCE won't eliminate CAT_new and CAT_get
-          if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
+          // DCE won't eliminate CAT_add, CAT_sub and CAT_set if the first operand is an argument
+          if ((calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set")) && !isa<Argument>(callInst->getArgOperand(0)))
             dceMap[callInst] = false;
         }
 
@@ -326,20 +351,23 @@ namespace
       // printRDAResult(F, IN, OUT);
 
       bool changed = false;
-      // dead code elimination, must be done right after RDA
-      changed |= deadCodeEli(F, IN);
 
       changed |= constantFoldAndAlgSimp(F, IN);
       changed |= constantProp(F, IN);
+
+      // to avoid all CAT_set being eliminated by DCE (so the signature will also be killed)
+      // we only do DCE when there is no further constant optimization
+      // DCE will not bring new optimization points to fold and propagation
+      if (!changed)
+        changed |= deadCodeEli(F, IN);
+
       return changed;
     }
 
-    // We don't modify the program, so we preserve all analyses.
     // The LLVM IR of functions isn't ready at this point
     void getAnalysisUsage(AnalysisUsage &AU) const override
     {
-      // errs() << "Hello LLVM World at \"getAnalysisUsage\"\n" ;
-      AU.setPreservesCFG();
+      // nothing is preserved, so we don't need to do anything here
     }
   };
 }
