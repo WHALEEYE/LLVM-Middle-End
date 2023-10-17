@@ -296,10 +296,7 @@ namespace
         deleteList.push_back(callInst);
       }
       for (auto *I : deleteList)
-      {
-        errs() << "Deleting in constant Fold: " << *I << "\n";
         I->eraseFromParent();
-      }
 
       return deleteList.size() > 0;
     }
@@ -331,10 +328,7 @@ namespace
       }
 
       for (auto I : deleteList)
-      {
-        errs() << "Deleting in constant Prop: " << *I << "\n";
         I->eraseFromParent();
-      }
 
       return deleteList.size() > 0;
     }
