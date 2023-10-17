@@ -14,9 +14,9 @@ using namespace llvm;
 
 namespace
 {
-  typedef std::map<Value *, std::set<CallInst *>> RDASet;
-  typedef std::map<Instruction *, std::map<Value *, std::set<CallInst *>>> RDAMap;
-  typedef std::map<CallInst *, bool> DCEMap;
+  typedef std::map<Value *, std::set<Instruction *>> RDASet;
+  typedef std::map<Instruction *, RDASet> RDAMap;
+  typedef std::map<Instruction *, bool> DCEMap;
 
   struct CAT : public FunctionPass
   {
@@ -36,7 +36,7 @@ namespace
     {
       RDASet curIN, curOUT;
       // create two temporary sets for comparing old OUT and new OUT
-      std::unordered_set<CallInst *> oldOut, newOut;
+      std::unordered_set<Instruction *> oldOut, newOut;
       bool firstTime = true;
 
       // if the block already have OUT, store it for further comparison
@@ -50,6 +50,7 @@ namespace
 
       // merge all the predecessors' OUTs into IN of the current block
       if (!predecessors(&BB).empty())
+      {
         for (auto *PB : predecessors(&BB))
         {
           // if the predecessor is not analyzed yet, skip
@@ -60,13 +61,14 @@ namespace
             for (auto *I : pair.second)
               curIN[pair.first].insert(I);
         }
+      }
       else
       {
         // if the block has no predecessors, then it's the entry block
         // initialize the IN of the entry block to the arguments
         for (auto &arg : BB.getParent()->args())
         {
-          curIN[&arg] = std::set<CallInst *>();
+          curIN[&arg] = std::set<Instruction *>();
           curIN[&arg].insert(nullptr);
         }
       }
@@ -84,25 +86,35 @@ namespace
           if (calledName.equals("CAT_new"))
           {
             gen = callInst;
-            curOUT[gen] = std::set<CallInst *>();
+            curOUT[gen] = std::set<Instruction *>();
             curOUT[gen].insert(callInst);
           }
           else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
           {
             gen = callInst->getArgOperand(0);
-            curOUT[gen] = std::set<CallInst *>();
+            curOUT[gen] = std::set<Instruction *>();
             curOUT[gen].insert(callInst);
           }
-          else if (!calledName.equals("CAT_get") && !calledName.equals("CAT_destroy"))
+          else if (!calledName.equals("CAT_get") && !calledName.equals("CAT_destroy") && !calledName.equals("printf"))
           {
-            // dealing with escaping variables, set all the parameters as gen
+            // dealing with escaping pointers, set all the parameters as gen
             for (auto &op : callInst->operands())
             {
               gen = op.get();
-              curOUT[gen] = std::set<CallInst *>();
+              // only consider the pointer operands
+              if (!gen->getType()->isPointerTy())
+                continue;
+              curOUT[gen] = std::set<Instruction *>();
               curOUT[gen].insert(callInst);
             }
           }
+        }
+        else if (I.getType()->isPointerTy() && isa<PHINode>(I))
+        {
+          // aliasing/multiple definition may be happening
+          // for now we only consider the case where the definition is a pointer (CAT are all pointers)
+          curOUT[&I] = std::set<Instruction *>();
+          curOUT[&I].insert(&I);
         }
 
         OUT[&I] = curOUT;
@@ -139,16 +151,66 @@ namespace
 
         for (auto &defPair : pair.second)
           for (auto *I : defPair.second)
-            errs() << *I << "\n";
+            if (I)
+              errs() << *I << "\n";
+            else
+              errs() << "Argument\n";
 
         errs() << "}\n**************************************\n***************** OUT\n{\n";
 
         for (auto &defPair : OUT[pair.first])
           for (auto *I : defPair.second)
-            errs() << *I << "\n";
+            if (I)
+              errs() << *I << "\n";
+            else
+              errs() << "Argument\n";
 
         errs() << "}\n**************************************\n";
       }
+    }
+
+    Value *walkPhi(PHINode *cur, RDASet &curIN, PHINode *root, bool first)
+    {
+      // errs() << "Walking PHI node: " << *cur << "\n";
+      // errs() << "Root: " << *root << "\n";
+      // errs() << "Detail: " << cur << " " << root << "\n";
+
+      // if we found a circle of PHI nodes, return nullptr
+      if (!first && cur == root)
+      {
+        errs() << "Circle of PHI nodes detected\n";
+        return nullptr;
+      }
+
+      Value *constant = nullptr;
+      // check the incoming values of the phi node recursively
+      for (auto &op : cur->incoming_values())
+      {
+        Value *newConstant;
+        if (auto *phiNode = dyn_cast<PHINode>(op))
+          // if the incoming value is still a phi node, then we need to check it recursively
+          newConstant = walkPhi(phiNode, curIN, root, false);
+        else
+          // a regular definition, check if it's constant
+          // note that we don't check the reaching definitions at the place of phi node
+          // we check it at the place where the constant folding/propagation is checked
+          // due to the reason that the aliases are pointers, not values
+          newConstant = getIfIsConstant(op, curIN);
+
+        if (!newConstant)
+          return nullptr;
+
+        if (!constant)
+          constant = newConstant;
+        else if (!isa<ConstantInt>(constant) || !isa<ConstantInt>(newConstant))
+          return nullptr;
+        else if (cast<ConstantInt>(constant)->getValue() == cast<ConstantInt>(newConstant)->getValue())
+          continue;
+        else
+          return nullptr;
+      }
+
+      return constant;
     }
 
     Value *getIfIsConstant(Value *operand, RDASet &curIN)
@@ -159,16 +221,27 @@ namespace
         // def may be nullptr, which means the operand is an argument
         if (!def)
           return nullptr;
-        
-        auto calledName = def->getCalledFunction()->getName();
-        Value *newConstant;
 
-        if (calledName.equals("CAT_new"))
-          newConstant = def->getOperand(0);
-        else if (calledName.equals("CAT_set"))
-          newConstant = def->getOperand(1);
+        Value *newConstant;
+        if (auto *callInst = dyn_cast<CallInst>(def))
+        {
+          auto calledName = callInst->getCalledFunction()->getName();
+          if (calledName.equals("CAT_new"))
+            newConstant = callInst->getOperand(0);
+          else if (calledName.equals("CAT_set"))
+            newConstant = callInst->getOperand(1);
+          else
+            // CAT_add, CAT_sub, or escaping variables
+            newConstant = nullptr;
+        }
         else
-          // CAT_add, CAT_sub, or escaping variables
+        {
+          // def is a phi node
+          auto *phiNode = cast<PHINode>(def);
+          newConstant = walkPhi(phiNode, curIN, phiNode, true);
+        }
+
+        if (!newConstant)
           return nullptr;
 
         if (!constant)
@@ -228,7 +301,10 @@ namespace
         deleteList.push_back(callInst);
       }
       for (auto *I : deleteList)
+      {
+        errs() << "Deleting in constant Fold: " << *I << "\n";
         I->eraseFromParent();
+      }
 
       return deleteList.size() > 0;
     }
@@ -260,7 +336,10 @@ namespace
       }
 
       for (auto I : deleteList)
+      {
+        errs() << "Deleting in constant Prop: " << *I << "\n";
         I->eraseFromParent();
+      }
 
       return deleteList.size() > 0;
     }
