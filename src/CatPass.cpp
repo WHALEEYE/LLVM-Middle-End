@@ -14,9 +14,9 @@ using namespace llvm;
 
 namespace
 {
-  typedef std::map<Value *, std::set<CallInst *>> RDASet;
-  typedef std::map<Instruction *, std::map<Value *, std::set<CallInst *>>> RDAMap;
-  typedef std::map<CallInst *, bool> DCEMap;
+  typedef std::map<Value *, std::set<Instruction *>> RDASet;
+  typedef std::map<Instruction *, RDASet> RDAMap;
+  typedef std::map<Instruction *, bool> DCEMap;
 
   struct CAT : public FunctionPass
   {
@@ -36,7 +36,7 @@ namespace
     {
       RDASet curIN, curOUT;
       // create two temporary sets for comparing old OUT and new OUT
-      std::unordered_set<CallInst *> oldOut, newOut;
+      std::unordered_set<Instruction *> oldOut, newOut;
       bool firstTime = true;
 
       // if the block already have OUT, store it for further comparison
@@ -50,6 +50,7 @@ namespace
 
       // merge all the predecessors' OUTs into IN of the current block
       if (!predecessors(&BB).empty())
+      {
         for (auto *PB : predecessors(&BB))
         {
           // if the predecessor is not analyzed yet, skip
@@ -60,6 +61,17 @@ namespace
             for (auto *I : pair.second)
               curIN[pair.first].insert(I);
         }
+      }
+      else
+      {
+        // if the block has no predecessors, then it's the entry block
+        // initialize the IN of the entry block to the arguments
+        for (auto &arg : BB.getParent()->args())
+        {
+          curIN[&arg] = std::set<Instruction *>();
+          curIN[&arg].insert(nullptr);
+        }
+      }
 
       // calculate IN and OUT for each instruction in the current block
       for (auto &I : BB)
@@ -74,15 +86,35 @@ namespace
           if (calledName.equals("CAT_new"))
           {
             gen = callInst;
-            curOUT[gen] = std::set<CallInst *>();
+            curOUT[gen] = std::set<Instruction *>();
             curOUT[gen].insert(callInst);
           }
           else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
           {
             gen = callInst->getArgOperand(0);
-            curOUT[gen] = std::set<CallInst *>();
+            curOUT[gen] = std::set<Instruction *>();
             curOUT[gen].insert(callInst);
           }
+          else if (!calledName.equals("CAT_get") && !calledName.equals("CAT_destroy") && !calledName.equals("printf"))
+          {
+            // dealing with escaping pointers, set all the parameters as gen
+            for (auto &op : callInst->operands())
+            {
+              gen = op.get();
+              // only consider the pointer operands
+              if (!gen->getType()->isPointerTy())
+                continue;
+              curOUT[gen] = std::set<Instruction *>();
+              curOUT[gen].insert(callInst);
+            }
+          }
+        }
+        else if (I.getType()->isPointerTy() && isa<PHINode>(I))
+        {
+          // aliasing/multiple definition may be happening
+          // for now we only consider the case where the definition is a pointer (CAT are all pointers)
+          curOUT[&I] = std::set<Instruction *>();
+          curOUT[&I].insert(&I);
         }
 
         OUT[&I] = curOUT;
@@ -119,16 +151,61 @@ namespace
 
         for (auto &defPair : pair.second)
           for (auto *I : defPair.second)
-            errs() << *I << "\n";
+            if (I)
+              errs() << *I << "\n";
+            else
+              errs() << "Argument\n";
 
         errs() << "}\n**************************************\n***************** OUT\n{\n";
 
         for (auto &defPair : OUT[pair.first])
           for (auto *I : defPair.second)
-            errs() << *I << "\n";
+            if (I)
+              errs() << *I << "\n";
+            else
+              errs() << "Argument\n";
 
         errs() << "}\n**************************************\n";
       }
+    }
+
+    Value *walkPhi(PHINode *cur, RDASet &curIN, PHINode *root, std::unordered_set<PHINode*> seen)
+    {
+
+      // if we found a circle of PHI nodes, return nullptr
+      if (seen.find(cur) != seen.end())
+        return nullptr;
+      seen.insert(cur);
+
+      Value *constant = nullptr;
+      // check the incoming values of the phi node recursively
+      for (auto &op : cur->incoming_values())
+      {
+        Value *newConstant;
+        if (auto *phiNode = dyn_cast<PHINode>(op))
+          // if the incoming value is still a phi node, then we need to check it recursively
+          newConstant = walkPhi(phiNode, curIN, root, seen);
+        else
+          // a regular definition, check if it's constant
+          // note that we don't check the reaching definitions at the place of phi node
+          // we check it at the place where the constant folding/propagation is checked
+          // due to the reason that the aliases are pointers, not values
+          newConstant = getIfIsConstant(op, curIN);
+
+        if (!newConstant)
+          return nullptr;
+
+        if (!constant)
+          constant = newConstant;
+        else if (!isa<ConstantInt>(constant) || !isa<ConstantInt>(newConstant))
+          return nullptr;
+        else if (cast<ConstantInt>(constant)->getValue() == cast<ConstantInt>(newConstant)->getValue())
+          continue;
+        else
+          return nullptr;
+      }
+
+      return constant;
     }
 
     Value *getIfIsConstant(Value *operand, RDASet &curIN)
@@ -136,15 +213,30 @@ namespace
       Value *constant = nullptr;
       for (auto def : curIN[operand])
       {
-        auto *callInst = cast<CallInst>(def);
-        auto calledName = callInst->getCalledFunction()->getName();
-        Value *newConstant;
+        // def may be nullptr, which means the operand is an argument
+        if (!def)
+          return nullptr;
 
-        if (calledName.equals("CAT_new"))
-          newConstant = callInst->getOperand(0);
-        else if (calledName.equals("CAT_set"))
-          newConstant = callInst->getOperand(1);
+        Value *newConstant;
+        if (auto *callInst = dyn_cast<CallInst>(def))
+        {
+          auto calledName = callInst->getCalledFunction()->getName();
+          if (calledName.equals("CAT_new"))
+            newConstant = callInst->getOperand(0);
+          else if (calledName.equals("CAT_set"))
+            newConstant = callInst->getOperand(1);
+          else
+            // CAT_add, CAT_sub, or escaping variables
+            newConstant = nullptr;
+        }
         else
+        {
+          // def is a phi node
+          auto *phiNode = cast<PHINode>(def);
+          newConstant = walkPhi(phiNode, curIN, phiNode, std::unordered_set<PHINode*>());
+        }
+
+        if (!newConstant)
           return nullptr;
 
         if (!constant)
@@ -256,7 +348,8 @@ namespace
           auto calledName = callInst->getCalledFunction()->getName();
           // register the call instruction if it is a CAT_add, CAT_sub or CAT_set, which may be deleted by DCE
           // DCE won't eliminate CAT_new and CAT_get
-          if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
+          // DCE won't eliminate CAT_add, CAT_sub and CAT_set if the first operand is an argument
+          if ((calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set")) && !isa<Argument>(callInst->getArgOperand(0)))
             dceMap[callInst] = false;
         }
 
@@ -326,20 +419,23 @@ namespace
       // printRDAResult(F, IN, OUT);
 
       bool changed = false;
-      // dead code elimination, must be done right after RDA
-      changed |= deadCodeEli(F, IN);
 
       changed |= constantFoldAndAlgSimp(F, IN);
       changed |= constantProp(F, IN);
+
+      // to avoid all CAT_set being eliminated by DCE (so the signature will also be killed)
+      // we only do DCE when there is no further constant optimization
+      // DCE will not bring new optimization points to fold and propagation
+      // if (!changed)
+      //   changed |= deadCodeEli(F, IN);
+
       return changed;
     }
 
-    // We don't modify the program, so we preserve all analyses.
     // The LLVM IR of functions isn't ready at this point
     void getAnalysisUsage(AnalysisUsage &AU) const override
     {
-      // errs() << "Hello LLVM World at \"getAnalysisUsage\"\n" ;
-      AU.setPreservesCFG();
+      // nothing is preserved, so we don't need to do anything here
     }
   };
 }
