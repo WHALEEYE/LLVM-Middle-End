@@ -66,6 +66,8 @@ namespace
       {
         // if the block has no predecessors, then it's the entry block
         // initialize the IN of the entry block to the arguments
+        // arguments should never be treated as constants even if they are assigned with constants
+        // also we need to propagate this to every variable that may be assigned with the arguments
         for (auto &arg : BB.getParent()->args())
         {
           curIN[&arg] = std::set<Instruction *>();
@@ -79,6 +81,8 @@ namespace
         IN[&I] = curIN;
         curOUT = curIN;
 
+        // arguments might be assigned in CAT_get, CAT_add, CAT_sub, also may escape
+        // but we shouldn't consider them as GEN
         if (auto *callInst = dyn_cast<CallInst>(&I))
         {
           Value *gen;
@@ -92,8 +96,12 @@ namespace
           else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
           {
             gen = callInst->getArgOperand(0);
-            curOUT[gen] = std::set<Instruction *>();
-            curOUT[gen].insert(callInst);
+            // never change the define set of arguments
+            if (!isa<Argument>(gen))
+            {
+              curOUT[gen] = std::set<Instruction *>();
+              curOUT[gen].insert(callInst);
+            }
           }
           else if (!calledName.equals("CAT_get") && !calledName.equals("CAT_destroy") && !calledName.equals("printf"))
           {
@@ -101,8 +109,8 @@ namespace
             for (auto &op : callInst->operands())
             {
               gen = op.get();
-              // only consider the pointer operands
-              if (!gen->getType()->isPointerTy())
+              // only consider the pointer operands that are not arguments
+              if (!gen->getType()->isPointerTy() || isa<Argument>(gen))
                 continue;
               curOUT[gen] = std::set<Instruction *>();
               curOUT[gen].insert(callInst);
@@ -169,7 +177,7 @@ namespace
       }
     }
 
-    Value *walkPhi(PHINode *cur, RDASet &curIN, PHINode *root, std::unordered_set<PHINode*> seen)
+    Value *walkPhi(PHINode *cur, RDASet &curIN, PHINode *root, std::unordered_set<PHINode *> seen)
     {
 
       // if we found a circle of PHI nodes, return nullptr
@@ -208,44 +216,45 @@ namespace
       return constant;
     }
 
-    Value *getIfIsConstant(Value *operand, RDASet &curIN)
+    ConstantInt *getIfIsConstant(Value *operand, RDASet &curIN)
     {
-      Value *constant = nullptr;
+
+      // arguments should never be treated as constants
+      if (isa<Argument>(operand))
+        return nullptr;
+
+      ConstantInt *constant = nullptr;
       for (auto def : curIN[operand])
       {
         // def may be nullptr, which means the operand is an argument
         if (!def)
           return nullptr;
 
-        Value *newConstant;
+        Value *candidate;
         if (auto *callInst = dyn_cast<CallInst>(def))
         {
           auto calledName = callInst->getCalledFunction()->getName();
           if (calledName.equals("CAT_new"))
-            newConstant = callInst->getOperand(0);
+            candidate = callInst->getOperand(0);
           else if (calledName.equals("CAT_set"))
-            newConstant = callInst->getOperand(1);
+            candidate = callInst->getOperand(1);
           else
             // CAT_add, CAT_sub, or escaping variables
-            newConstant = nullptr;
+            candidate = nullptr;
         }
         else
         {
           // def is a phi node
           auto *phiNode = cast<PHINode>(def);
-          newConstant = walkPhi(phiNode, curIN, phiNode, std::unordered_set<PHINode*>());
+          candidate = walkPhi(phiNode, curIN, phiNode, std::unordered_set<PHINode *>());
         }
 
-        if (!newConstant)
+        if (!candidate || !isa<ConstantInt>(candidate))
           return nullptr;
 
         if (!constant)
-          constant = newConstant;
-        else if (!isa<ConstantInt>(constant) || !isa<ConstantInt>(newConstant))
-          return nullptr;
-        else if (cast<ConstantInt>(constant)->getValue() == cast<ConstantInt>(newConstant)->getValue())
-          continue;
-        else
+          constant = cast<ConstantInt>(candidate);
+        else if (constant->getValue() != cast<ConstantInt>(candidate)->getValue())
           return nullptr;
       }
 
