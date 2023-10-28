@@ -11,11 +11,14 @@
 #include <queue>
 
 using namespace llvm;
+#define PASSED_IN nullptr
 
 namespace
 {
   typedef std::map<Value *, std::set<Instruction *>> RDASet;
   typedef std::map<Instruction *, RDASet> RDAMap;
+  typedef std::map<Value *, std::set<Value *>> AliasSet;
+  typedef std::map<Instruction *, AliasSet> AliasMap;
   typedef std::map<Instruction *, bool> DCEMap;
 
   struct CAT : public FunctionPass
@@ -32,11 +35,13 @@ namespace
       return false;
     }
 
-    bool RDAinBB(BasicBlock &BB, RDAMap &IN, RDAMap &OUT)
+    bool RDAinBB(BasicBlock &BB, RDAMap &IN, RDAMap &OUT, AliasMap &aliIN, AliasMap &aliOUT)
     {
       RDASet curIN, curOUT;
+      AliasSet curAliIN, curAliOUT;
       // create two temporary sets for comparing old OUT and new OUT
       std::unordered_set<Instruction *> oldOut, newOut;
+      AliasSet oldAliOUT;
       bool firstTime = true;
 
       // if the block already have OUT, store it for further comparison
@@ -46,9 +51,11 @@ namespace
         for (auto &pair : OUT[BB.getTerminator()])
           for (auto *I : pair.second)
             oldOut.insert(I);
+        // also store the aliasing information
+        oldAliOUT = aliOUT[BB.getTerminator()];
       }
 
-      // merge all the predecessors' OUTs into IN of the current block
+      // merge the predecessors' information
       if (!predecessors(&BB).empty())
       {
         for (auto *PB : predecessors(&BB))
@@ -57,21 +64,25 @@ namespace
           if (OUT.find(PB->getTerminator()) == OUT.end())
             continue;
 
+          // merge the reaching definitions
           for (auto &pair : OUT[PB->getTerminator()])
             for (auto *I : pair.second)
               curIN[pair.first].insert(I);
+
+          // merge the aliasing information
+          for (auto &pair : aliOUT[PB->getTerminator()])
+            for (auto *I : pair.second)
+              curAliIN[pair.first].insert(I);
         }
       }
       else
       {
         // if the block has no predecessors, then it's the entry block
         // initialize the IN of the entry block to the arguments
-        // arguments should never be treated as constants even if they are assigned with constants
-        // also we need to propagate this to every variable that may be assigned with the arguments
         for (auto &arg : BB.getParent()->args())
         {
           curIN[&arg] = std::set<Instruction *>();
-          curIN[&arg].insert(nullptr);
+          curIN[&arg].insert(PASSED_IN);
         }
       }
 
@@ -80,9 +91,10 @@ namespace
       {
         IN[&I] = curIN;
         curOUT = curIN;
+        aliIN[&I] = curAliIN;
+        curAliOUT = curAliIN;
 
-        // arguments might be assigned in CAT_get, CAT_add, CAT_sub, also may escape
-        // but we shouldn't consider them as GEN
+        // arguments might be assigned in CAT_get, CAT_add, CAT_sub, or in functions
         if (auto *callInst = dyn_cast<CallInst>(&I))
         {
           Value *gen;
@@ -92,25 +104,22 @@ namespace
             gen = callInst;
             curOUT[gen] = std::set<Instruction *>();
             curOUT[gen].insert(callInst);
+            // add itself to its own aliasing set, in case that it's not inside yet
+            curAliOUT[gen].insert(gen);
           }
           else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
           {
             gen = callInst->getArgOperand(0);
-            // never change the define set of arguments
-            if (!isa<Argument>(gen))
-            {
-              curOUT[gen] = std::set<Instruction *>();
-              curOUT[gen].insert(callInst);
-            }
+            curOUT[gen] = std::set<Instruction *>();
+            curOUT[gen].insert(callInst);
           }
           else if (!calledName.equals("CAT_get") && !calledName.equals("CAT_destroy") && !calledName.equals("printf"))
           {
-            // dealing with escaping pointers, set all the parameters as gen
+            // dealing with references that are passed into functions
             for (auto &op : callInst->operands())
             {
               gen = op.get();
-              // only consider the pointer operands that are not arguments
-              if (!gen->getType()->isPointerTy() || isa<Argument>(gen))
+              if (!gen->getType()->isPointerTy())
                 continue;
               curOUT[gen] = std::set<Instruction *>();
               curOUT[gen].insert(callInst);
@@ -121,12 +130,28 @@ namespace
         {
           // aliasing/multiple definition may be happening
           // for now we only consider the case where the definition is a pointer (CAT are all pointers)
-          curOUT[&I] = std::set<Instruction *>();
-          curOUT[&I].insert(&I);
-        }
+          // add the aliasing information, no need to add the reaching definitions (because no CAT_data is changed or created)
+          auto *phiNode = cast<PHINode>(&I);
+          // remove the alias from all the sets that contain it
+          for (auto *aliased : curAliIN[phiNode])
+            curAliOUT[aliased].erase(phiNode);
 
+          // clear the current set, initialize it with itself
+          curAliOUT[phiNode] = std::set<Value *>();
+          curAliOUT[phiNode].insert(phiNode);
+
+          // for each incoming value, add the aliasing information
+          for (auto &op : phiNode->incoming_values())
+            for (auto *aliased : curAliIN[op.get()])
+            {
+              curAliOUT[phiNode].insert(aliased);
+              curAliOUT[aliased].insert(phiNode);
+            }
+        }
         OUT[&I] = curOUT;
         curIN = curOUT;
+        aliOUT[&I] = curAliOUT;
+        curAliIN = curAliOUT;
       }
 
       // if the block is analyzed for the first time, then we need to add its successors to the queue
@@ -177,91 +202,82 @@ namespace
       }
     }
 
-    Value *walkPhi(PHINode *cur, RDASet &curIN, PHINode *root, std::unordered_set<PHINode *> seen)
+    // Value *walkPhi(PHINode *cur, RDASet &curIN, PHINode *root, std::unordered_set<PHINode *> seen)
+    // {
+
+    //   // if we found a circle of PHI nodes, return nullptr
+    //   if (seen.find(cur) != seen.end())
+    //     return nullptr;
+    //   seen.insert(cur);
+
+    //   Value *constant = nullptr;
+    //   // check the incoming values of the phi node recursively
+    //   for (auto &op : cur->incoming_values())
+    //   {
+    //     Value *newConstant;
+    //     if (auto *phiNode = dyn_cast<PHINode>(op))
+    //       // if the incoming value is still a phi node, then we need to check it recursively
+    //       newConstant = walkPhi(phiNode, curIN, root, seen);
+    //     else
+    //       // a regular definition, check if it's constant
+    //       // note that we don't check the reaching definitions at the place of phi node
+    //       // we check it at the place where the constant folding/propagation is checked
+    //       // due to the reason that the aliases are pointers, not values
+    //       newConstant = getIfIsConstant(op, curIN, );
+
+    //     if (!newConstant)
+    //       return nullptr;
+
+    //     if (!constant)
+    //       constant = newConstant;
+    //     else if (!isa<ConstantInt>(constant) || !isa<ConstantInt>(newConstant))
+    //       return nullptr;
+    //     else if (cast<ConstantInt>(constant)->getValue() == cast<ConstantInt>(newConstant)->getValue())
+    //       continue;
+    //     else
+    //       return nullptr;
+    //   }
+
+    //   return constant;
+    // }
+
+    ConstantInt *getIfIsConstant(Value *operand, RDASet &curIN, AliasSet &curAliIN)
     {
-
-      // if we found a circle of PHI nodes, return nullptr
-      if (seen.find(cur) != seen.end())
-        return nullptr;
-      seen.insert(cur);
-
-      Value *constant = nullptr;
-      // check the incoming values of the phi node recursively
-      for (auto &op : cur->incoming_values())
-      {
-        Value *newConstant;
-        if (auto *phiNode = dyn_cast<PHINode>(op))
-          // if the incoming value is still a phi node, then we need to check it recursively
-          newConstant = walkPhi(phiNode, curIN, root, seen);
-        else
-          // a regular definition, check if it's constant
-          // note that we don't check the reaching definitions at the place of phi node
-          // we check it at the place where the constant folding/propagation is checked
-          // due to the reason that the aliases are pointers, not values
-          newConstant = getIfIsConstant(op, curIN);
-
-        if (!newConstant)
-          return nullptr;
-
-        if (!constant)
-          constant = newConstant;
-        else if (!isa<ConstantInt>(constant) || !isa<ConstantInt>(newConstant))
-          return nullptr;
-        else if (cast<ConstantInt>(constant)->getValue() == cast<ConstantInt>(newConstant)->getValue())
-          continue;
-        else
-          return nullptr;
-      }
-
-      return constant;
-    }
-
-    ConstantInt *getIfIsConstant(Value *operand, RDASet &curIN)
-    {
-
-      // arguments should never be treated as constants
-      if (isa<Argument>(operand))
-        return nullptr;
-
       ConstantInt *constant = nullptr;
-      for (auto def : curIN[operand])
-      {
-        // def may be nullptr, which means the operand is an argument
-        if (!def)
-          return nullptr;
-
-        Value *candidate;
-        if (auto *callInst = dyn_cast<CallInst>(def))
+      // here, we check all the defs of all the alias of the operand
+      for (auto *alias : curAliIN[operand])
+        for (auto *def : curIN[alias])
         {
-          auto calledName = callInst->getCalledFunction()->getName();
-          if (calledName.equals("CAT_new"))
-            candidate = callInst->getOperand(0);
-          else if (calledName.equals("CAT_set"))
-            candidate = callInst->getOperand(1);
-          else
-            // CAT_add, CAT_sub, or escaping variables
-            candidate = nullptr;
-        }
-        else
-        {
-          // def is a phi node
-          auto *phiNode = cast<PHINode>(def);
-          candidate = walkPhi(phiNode, curIN, phiNode, std::unordered_set<PHINode *>());
-        }
+          // def may be PASSED_IN, which means the operand may be defined outside the function
+          if (def == PASSED_IN)
+            return nullptr;
 
-        if (!candidate || !isa<ConstantInt>(candidate))
-          return nullptr;
+          Value *candidate = nullptr;
+          if (auto *callInst = dyn_cast<CallInst>(def))
+          {
+            auto calledName = callInst->getCalledFunction()->getName();
+            if (calledName.equals("CAT_new"))
+              candidate = callInst->getOperand(0);
+            else if (calledName.equals("CAT_set"))
+              candidate = callInst->getOperand(1);
+            else
+              // CAT_add, CAT_sub, or passed into functions
+              candidate = nullptr;
+          }
 
-        if (!constant)
-          constant = cast<ConstantInt>(candidate);
-        else if (constant->getValue() != cast<ConstantInt>(candidate)->getValue())
-          return nullptr;
-      }
+          if (!candidate || !isa<ConstantInt>(candidate))
+            return nullptr;
+
+          if (!constant)
+            constant = cast<ConstantInt>(candidate);
+          else if (constant->getValue() != cast<ConstantInt>(candidate)->getValue())
+            return nullptr;
+        }
 
       return constant;
     }
 
-    bool constantFoldAndAlgSimp(Function &F, RDAMap &IN)
+    bool constantFoldAndAlgSimp(Function &F, RDAMap &IN, AliasMap &aliIN)
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
@@ -280,10 +296,19 @@ namespace
         if (!(calledName.equals("CAT_add") || calledName.equals("CAT_sub")))
           continue;
 
+        // algorithmic simplification, sub x x = 0
+        // if (calledName.equals("CAT_sub") && callInst->getOperand(1) == callInst->getOperand(2))
+        // {
+        //   IRBuilder<> builder(callInst);
+        //   builder.CreateCall(F.getParent()->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), ConstantInt::get(Type::getInt64Ty(F.getContext()), 0)}));
+        //   deleteList.push_back(callInst);
+        //   continue;
+        // }
+
         // check if all the definitions of the operands that reach the call instruction are constant
         auto op1 = callInst->getOperand(1);
         auto op2 = callInst->getOperand(2);
-        auto *constant1 = getIfIsConstant(op1, IN[I]), *constant2 = getIfIsConstant(op2, IN[I]);
+        auto *constant1 = getIfIsConstant(op1, IN[I], aliIN[I]), *constant2 = getIfIsConstant(op2, IN[I], aliIN[I]);
         if (!constant1 && !constant2)
           continue;
 
@@ -310,7 +335,7 @@ namespace
       return deleteList.size() > 0;
     }
 
-    bool constantProp(Function &F, RDAMap &IN)
+    bool constantProp(Function &F, RDAMap &IN, AliasMap &aliIN)
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
@@ -328,7 +353,7 @@ namespace
         if (!calledName.equals("CAT_get"))
           continue;
 
-        auto *constant = getIfIsConstant(callInst->getOperand(0), IN[I]);
+        auto *constant = getIfIsConstant(callInst->getOperand(0), IN[I], aliIN[I]);
         if (!constant)
           continue;
 
@@ -407,6 +432,7 @@ namespace
     bool runOnFunction(Function &F) override
     {
       RDAMap IN, OUT;
+      AliasMap aliIN, aliOUT;
       std::queue<BasicBlock *> toBeAnalyzed;
 
       // initialize the queue with all the blocks without predecessors
@@ -421,7 +447,7 @@ namespace
 
         // try to analyze the block
         // if the block is changed, add its successors to the queue
-        if (RDAinBB(*BB, IN, OUT))
+        if (RDAinBB(*BB, IN, OUT, aliIN, aliOUT))
           for (auto *suc : successors(BB))
             toBeAnalyzed.push(suc);
       }
@@ -429,8 +455,8 @@ namespace
 
       bool changed = false;
 
-      changed |= constantFoldAndAlgSimp(F, IN);
-      changed |= constantProp(F, IN);
+      changed |= constantFoldAndAlgSimp(F, IN, aliIN);
+      changed |= constantProp(F, IN, aliIN);
 
       // to avoid all CAT_set being eliminated by DCE (so the signature will also be killed)
       // we only do DCE when there is no further constant optimization
