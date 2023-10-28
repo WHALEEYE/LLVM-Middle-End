@@ -41,7 +41,7 @@ namespace
       AliasSet curAliIN, curAliOUT;
       // create two temporary sets for comparing old OUT and new OUT
       std::unordered_set<Instruction *> oldOut, newOut;
-      AliasSet oldAliOUT;
+      AliasSet oldAliOUT, newAliOUT;
       bool firstTime = true;
 
       // if the block already have OUT, store it for further comparison
@@ -104,7 +104,11 @@ namespace
             gen = callInst;
             curOUT[gen] = std::set<Instruction *>();
             curOUT[gen].insert(callInst);
-            // add itself to its own aliasing set, in case that it's not inside yet
+
+            // it becomes a new ref, so reset all its alias info
+            for (auto *aliased : curAliIN[gen])
+              curAliOUT[aliased].erase(gen);
+            curAliOUT[gen] = std::set<Value *>();
             curAliOUT[gen].insert(gen);
           }
           else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
@@ -135,22 +139,21 @@ namespace
         {
           // aliasing/multiple definition may be happening
           // for now we only consider the case where the definition is a pointer (CAT are all pointers)
-          // add the aliasing information, no need to add the reaching definitions (because no CAT_data is changed or created)
           auto *phiNode = cast<PHINode>(&I);
-          // remove the alias from all the sets that contain it
+
+          // reset its alias info
           for (auto *aliased : curAliIN[phiNode])
             curAliOUT[aliased].erase(phiNode);
-
-          // clear the current set, initialize it with itself
           curAliOUT[phiNode] = std::set<Value *>();
           curAliOUT[phiNode].insert(phiNode);
 
+          // clear the RDA IN set
           curOUT[phiNode] = std::set<Instruction *>();
+
           // for each incoming value, add the aliasing information and merge their reaching definitions
           for (auto &op : phiNode->incoming_values())
           {
             curOUT[phiNode].insert(curIN[op.get()].begin(), curIN[op.get()].end());
-
             for (auto *aliased : curAliIN[op.get()])
             {
               curAliOUT[phiNode].insert(aliased);
@@ -173,13 +176,24 @@ namespace
         for (auto *I : pair.second)
           newOut.insert(I);
 
-      if (oldOut.size() != newOut.size())
+      newAliOUT = aliOUT[BB.getTerminator()];
+
+      if (oldOut.size() != newOut.size() || oldAliOUT.size() != newAliOUT.size())
         return true;
 
       for (auto *I : oldOut)
         // found a difference, so the block is changed
         if (newOut.find(I) == newOut.end())
           return true;
+
+      // compare the aliasing information
+      for (auto &pair : oldAliOUT)
+        if (newAliOUT.find(pair.first) == newAliOUT.end())
+          return true;
+        else
+          for (auto *I : pair.second)
+            if (newAliOUT[pair.first].find(I) == newAliOUT[pair.first].end())
+              return true;
 
       // the block is not changed if the two sets are equal
       return false;
@@ -228,10 +242,8 @@ namespace
           auto calledName = callInst->getCalledFunction()->getName();
           if (calledName.equals("CAT_new"))
             candidate = callInst->getOperand(0);
-          else if (calledName.equals("CAT_set")){
+          else if (calledName.equals("CAT_set"))
             candidate = callInst->getOperand(1);
-            errs() << "candidate: " << *candidate << "\n";
-            errs() << "isConstant: " << isa<ConstantInt>(candidate) << "\n";}
           else
             // CAT_add, CAT_sub, or passed into functions
             candidate = nullptr;
