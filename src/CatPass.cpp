@@ -94,8 +94,50 @@ namespace
         aliIN[&I] = curAliIN;
         curAliOUT = curAliIN;
 
-        // arguments might be assigned in CAT_get, CAT_add, CAT_sub, or in functions
-        if (auto *callInst = dyn_cast<CallInst>(&I))
+        // PHI nodes
+        if (I.getType()->isPointerTy() && isa<PHINode>(I))
+        {
+          // aliasing/multiple definition may be happening
+          // for now we only consider the case where the definition is a pointer (CAT are all pointers)
+          auto *phiNode = cast<PHINode>(&I);
+
+          // reset its alias info
+          for (auto *alias : curAliIN[phiNode])
+            curAliOUT[alias].erase(phiNode);
+          curAliOUT[phiNode] = std::set<Value *>();
+          curAliOUT[phiNode].insert(phiNode);
+
+          // clear the RDA IN set
+          curOUT[phiNode] = std::set<Instruction *>();
+
+          // for each incoming value, add the aliasing information and merge their reaching definitions
+          // only consider the information in the corresponding predecessor
+          Value *incomingVal;
+          BasicBlock *predBB;
+          int n = phiNode->getNumIncomingValues();
+          for (int i = 0; i < n; i++)
+          {
+            incomingVal = phiNode->getIncomingValue(i);
+            predBB = phiNode->getIncomingBlock(i);
+            // if the predecessor is not analyzed yet, skip
+            if (OUT.find(predBB->getTerminator()) == OUT.end())
+              continue;
+
+            // merge the reaching definitions
+            // reaching defs of the incoming value
+            std::set<Instruction *> reachingDefs = OUT[predBB->getTerminator()][incomingVal];
+            curOUT[phiNode].insert(reachingDefs.begin(), reachingDefs.end());
+
+            // merge the aliasing information
+            for (auto *alias : aliOUT[predBB->getTerminator()][incomingVal])
+            {
+              curAliOUT[phiNode].insert(alias);
+              curAliOUT[alias].insert(phiNode);
+            }
+          }
+        }
+        // assignment to CAT_data
+        else if (auto *callInst = dyn_cast<CallInst>(&I))
         {
           Value *gen = nullptr;
           auto calledName = callInst->getCalledFunction()->getName();
@@ -130,36 +172,10 @@ namespace
             }
           }
           // for all the other aliases, add the call instruction to their reaching definitions
-          // because its possible that their values are changed by this call
+          // because it's possible that their values are changed by this call
           if (gen)
             for (auto *aliased : curAliOUT[gen])
               curOUT[aliased].insert(callInst);
-        }
-        else if (I.getType()->isPointerTy() && isa<PHINode>(I))
-        {
-          // aliasing/multiple definition may be happening
-          // for now we only consider the case where the definition is a pointer (CAT are all pointers)
-          auto *phiNode = cast<PHINode>(&I);
-
-          // reset its alias info
-          for (auto *aliased : curAliIN[phiNode])
-            curAliOUT[aliased].erase(phiNode);
-          curAliOUT[phiNode] = std::set<Value *>();
-          curAliOUT[phiNode].insert(phiNode);
-
-          // clear the RDA IN set
-          curOUT[phiNode] = std::set<Instruction *>();
-
-          // for each incoming value, add the aliasing information and merge their reaching definitions
-          for (auto &op : phiNode->incoming_values())
-          {
-            curOUT[phiNode].insert(curIN[op.get()].begin(), curIN[op.get()].end());
-            for (auto *aliased : curAliIN[op.get()])
-            {
-              curAliOUT[phiNode].insert(aliased);
-              curAliOUT[aliased].insert(phiNode);
-            }
-          }
         }
         OUT[&I] = curOUT;
         curIN = curOUT;
@@ -279,15 +295,6 @@ namespace
 
         if (!(calledName.equals("CAT_add") || calledName.equals("CAT_sub")))
           continue;
-
-        // algorithmic simplification, sub x x = 0
-        // if (calledName.equals("CAT_sub") && callInst->getOperand(1) == callInst->getOperand(2))
-        // {
-        //   IRBuilder<> builder(callInst);
-        //   builder.CreateCall(F.getParent()->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), ConstantInt::get(Type::getInt64Ty(F.getContext()), 0)}));
-        //   deleteList.push_back(callInst);
-        //   continue;
-        // }
 
         // check if all the definitions of the operands that reach the call instruction are constant
         auto op1 = callInst->getOperand(1);
