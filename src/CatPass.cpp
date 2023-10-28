@@ -97,7 +97,7 @@ namespace
         // arguments might be assigned in CAT_get, CAT_add, CAT_sub, or in functions
         if (auto *callInst = dyn_cast<CallInst>(&I))
         {
-          Value *gen;
+          Value *gen = nullptr;
           auto calledName = callInst->getCalledFunction()->getName();
           if (calledName.equals("CAT_new"))
           {
@@ -125,6 +125,11 @@ namespace
               curOUT[gen].insert(callInst);
             }
           }
+          // for all the other aliases, add the call instruction to their reaching definitions
+          // because its possible that their values are changed by this call
+          if (gen)
+            for (auto *aliased : curAliOUT[gen])
+              curOUT[aliased].insert(callInst);
         }
         else if (I.getType()->isPointerTy() && isa<PHINode>(I))
         {
@@ -140,13 +145,18 @@ namespace
           curAliOUT[phiNode] = std::set<Value *>();
           curAliOUT[phiNode].insert(phiNode);
 
-          // for each incoming value, add the aliasing information
+          curOUT[phiNode] = std::set<Instruction *>();
+          // for each incoming value, add the aliasing information and merge their reaching definitions
           for (auto &op : phiNode->incoming_values())
+          {
+            curOUT[phiNode].insert(curIN[op.get()].begin(), curIN[op.get()].end());
+
             for (auto *aliased : curAliIN[op.get()])
             {
               curAliOUT[phiNode].insert(aliased);
               curAliOUT[aliased].insert(phiNode);
             }
+          }
         }
         OUT[&I] = curOUT;
         curIN = curOUT;
@@ -202,77 +212,39 @@ namespace
       }
     }
 
-    // Value *walkPhi(PHINode *cur, RDASet &curIN, PHINode *root, std::unordered_set<PHINode *> seen)
-    // {
-
-    //   // if we found a circle of PHI nodes, return nullptr
-    //   if (seen.find(cur) != seen.end())
-    //     return nullptr;
-    //   seen.insert(cur);
-
-    //   Value *constant = nullptr;
-    //   // check the incoming values of the phi node recursively
-    //   for (auto &op : cur->incoming_values())
-    //   {
-    //     Value *newConstant;
-    //     if (auto *phiNode = dyn_cast<PHINode>(op))
-    //       // if the incoming value is still a phi node, then we need to check it recursively
-    //       newConstant = walkPhi(phiNode, curIN, root, seen);
-    //     else
-    //       // a regular definition, check if it's constant
-    //       // note that we don't check the reaching definitions at the place of phi node
-    //       // we check it at the place where the constant folding/propagation is checked
-    //       // due to the reason that the aliases are pointers, not values
-    //       newConstant = getIfIsConstant(op, curIN, );
-
-    //     if (!newConstant)
-    //       return nullptr;
-
-    //     if (!constant)
-    //       constant = newConstant;
-    //     else if (!isa<ConstantInt>(constant) || !isa<ConstantInt>(newConstant))
-    //       return nullptr;
-    //     else if (cast<ConstantInt>(constant)->getValue() == cast<ConstantInt>(newConstant)->getValue())
-    //       continue;
-    //     else
-    //       return nullptr;
-    //   }
-
-    //   return constant;
-    // }
-
-    ConstantInt *getIfIsConstant(Value *operand, RDASet &curIN, AliasSet &curAliIN)
+    ConstantInt *getIfIsConstant(Value *operand, RDASet &curIN)
     {
       ConstantInt *constant = nullptr;
-      // here, we check all the defs of all the alias of the operand
-      for (auto *alias : curAliIN[operand])
-        for (auto *def : curIN[alias])
+
+      for (auto *def : curIN[operand])
+      {
+        // def may be PASSED_IN, which means the operand may be defined outside the function
+        if (def == PASSED_IN)
+          return nullptr;
+
+        Value *candidate = nullptr;
+        if (auto *callInst = dyn_cast<CallInst>(def))
         {
-          // def may be PASSED_IN, which means the operand may be defined outside the function
-          if (def == PASSED_IN)
-            return nullptr;
-
-          Value *candidate = nullptr;
-          if (auto *callInst = dyn_cast<CallInst>(def))
-          {
-            auto calledName = callInst->getCalledFunction()->getName();
-            if (calledName.equals("CAT_new"))
-              candidate = callInst->getOperand(0);
-            else if (calledName.equals("CAT_set"))
-              candidate = callInst->getOperand(1);
-            else
-              // CAT_add, CAT_sub, or passed into functions
-              candidate = nullptr;
-          }
-
-          if (!candidate || !isa<ConstantInt>(candidate))
-            return nullptr;
-
-          if (!constant)
-            constant = cast<ConstantInt>(candidate);
-          else if (constant->getValue() != cast<ConstantInt>(candidate)->getValue())
-            return nullptr;
+          auto calledName = callInst->getCalledFunction()->getName();
+          if (calledName.equals("CAT_new"))
+            candidate = callInst->getOperand(0);
+          else if (calledName.equals("CAT_set")){
+            candidate = callInst->getOperand(1);
+            errs() << "candidate: " << *candidate << "\n";
+            errs() << "isConstant: " << isa<ConstantInt>(candidate) << "\n";}
+          else
+            // CAT_add, CAT_sub, or passed into functions
+            candidate = nullptr;
         }
+
+        if (!candidate || !isa<ConstantInt>(candidate))
+          return nullptr;
+
+        if (!constant)
+          constant = cast<ConstantInt>(candidate);
+        else if (constant->getValue() != cast<ConstantInt>(candidate)->getValue())
+          return nullptr;
+      }
 
       return constant;
     }
@@ -308,7 +280,7 @@ namespace
         // check if all the definitions of the operands that reach the call instruction are constant
         auto op1 = callInst->getOperand(1);
         auto op2 = callInst->getOperand(2);
-        auto *constant1 = getIfIsConstant(op1, IN[I], aliIN[I]), *constant2 = getIfIsConstant(op2, IN[I], aliIN[I]);
+        auto *constant1 = getIfIsConstant(op1, IN[I]), *constant2 = getIfIsConstant(op2, IN[I]);
         if (!constant1 && !constant2)
           continue;
 
@@ -353,7 +325,7 @@ namespace
         if (!calledName.equals("CAT_get"))
           continue;
 
-        auto *constant = getIfIsConstant(callInst->getOperand(0), IN[I], aliIN[I]);
+        auto *constant = getIfIsConstant(callInst->getOperand(0), IN[I]);
         if (!constant)
           continue;
 
