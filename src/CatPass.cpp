@@ -35,6 +35,23 @@ namespace
       return false;
     }
 
+    void resetAliasInfo(Value *v, AliasSet &curAliIN, AliasSet &curAliOUT)
+    {
+      for (auto *alias : curAliIN[v])
+        curAliOUT[alias].erase(v);
+      curAliOUT[v].clear();
+      curAliOUT[v].insert(v);
+    }
+
+    void addDefWithAlias(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT)
+    {
+      for (auto *alias : aliases[v])
+        curOUT[alias].insert(def);
+
+      curOUT[v].clear();
+      curOUT[v].insert(def);
+    }
+
     bool RDAinBB(BasicBlock &BB, RDAMap &IN, RDAMap &OUT, AliasMap &aliIN, AliasMap &aliOUT)
     {
       RDASet curIN, curOUT;
@@ -44,26 +61,18 @@ namespace
       AliasSet oldAliOUT, newAliOUT;
       bool firstTime = true;
 
-      // if the block already have OUT, store it for further comparison
-      if (OUT.find(BB.getTerminator()) != OUT.end())
-      {
-        firstTime = false;
-        for (auto &pair : OUT[BB.getTerminator()])
-          for (auto *I : pair.second)
-            oldOut.insert(I);
-        // also store the aliasing information
-        oldAliOUT = aliOUT[BB.getTerminator()];
-      }
+      firstTime = OUT.find(BB.getTerminator()) == OUT.end();
+
+      for (auto &pair : OUT[BB.getTerminator()])
+        for (auto *I : pair.second)
+          oldOut.insert(I);
+      // also store the aliasing information
+      oldAliOUT = aliOUT[BB.getTerminator()];
 
       // merge the predecessors' information
       if (!predecessors(&BB).empty())
-      {
         for (auto *PB : predecessors(&BB))
         {
-          // if the predecessor is not analyzed yet, skip
-          if (OUT.find(PB->getTerminator()) == OUT.end())
-            continue;
-
           // merge the reaching definitions
           for (auto &pair : OUT[PB->getTerminator()])
             for (auto *I : pair.second)
@@ -74,17 +83,14 @@ namespace
             for (auto *I : pair.second)
               curAliIN[pair.first].insert(I);
         }
-      }
       else
-      {
         // if the block has no predecessors, then it's the entry block
         // initialize the IN of the entry block to the arguments
         for (auto &arg : BB.getParent()->args())
         {
-          curIN[&arg] = std::set<Instruction *>();
+          curIN[&arg].clear();
           curIN[&arg].insert(PASSED_IN);
         }
-      }
 
       // calculate IN and OUT for each instruction in the current block
       for (auto &I : BB)
@@ -94,7 +100,7 @@ namespace
         aliIN[&I] = curAliIN;
         curAliOUT = curAliIN;
 
-        // PHI nodes
+        // PHI
         if (I.getType()->isPointerTy() && isa<PHINode>(I))
         {
           // aliasing/multiple definition may be happening
@@ -102,13 +108,9 @@ namespace
           auto *phiNode = cast<PHINode>(&I);
 
           // reset its alias info
-          for (auto *alias : curAliIN[phiNode])
-            curAliOUT[alias].erase(phiNode);
-          curAliOUT[phiNode] = std::set<Value *>();
-          curAliOUT[phiNode].insert(phiNode);
-
-          // clear the RDA IN set
-          curOUT[phiNode] = std::set<Instruction *>();
+          resetAliasInfo(phiNode, curAliIN, curAliOUT);
+          // clear the RDA set
+          curOUT[phiNode].clear();
 
           // for each incoming value, add the aliasing information and merge their reaching definitions
           // only consider the information in the corresponding predecessor
@@ -136,6 +138,26 @@ namespace
             }
           }
         }
+        // SELECT
+        else if (I.getType()->isPointerTy() && isa<SelectInst>(I))
+        {
+          auto *selectInst = cast<SelectInst>(&I);
+          auto *op1 = selectInst->getOperand(1), *op2 = selectInst->getOperand(2);
+
+          resetAliasInfo(selectInst, curAliIN, curAliOUT);
+          curOUT[selectInst].clear();
+
+          for (auto *op : {op1, op2})
+          {
+            for (auto *alias : curAliIN[op])
+            {
+              curAliOUT[selectInst].insert(alias);
+              curAliOUT[alias].insert(selectInst);
+            }
+            std::set<Instruction *> reachingDefs = curIN[op];
+            curOUT[selectInst].insert(reachingDefs.begin(), reachingDefs.end());
+          }
+        }
         // assignment to CAT_data
         else if (auto *callInst = dyn_cast<CallInst>(&I))
         {
@@ -144,20 +166,15 @@ namespace
           if (calledName.equals("CAT_new"))
           {
             gen = callInst;
-            curOUT[gen] = std::set<Instruction *>();
+            // reset the aliasing information
+            resetAliasInfo(gen, curAliIN, curAliOUT);
+            curOUT[gen].clear();
             curOUT[gen].insert(callInst);
-
-            // it becomes a new ref, so reset all its alias info
-            for (auto *aliased : curAliIN[gen])
-              curAliOUT[aliased].erase(gen);
-            curAliOUT[gen] = std::set<Value *>();
-            curAliOUT[gen].insert(gen);
           }
           else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
           {
             gen = callInst->getArgOperand(0);
-            curOUT[gen] = std::set<Instruction *>();
-            curOUT[gen].insert(callInst);
+            addDefWithAlias(gen, callInst, curAliIN, curOUT);
           }
           else if (!calledName.equals("CAT_get") && !calledName.equals("CAT_destroy") && !calledName.equals("printf"))
           {
@@ -167,15 +184,9 @@ namespace
               gen = op.get();
               if (!gen->getType()->isPointerTy())
                 continue;
-              curOUT[gen] = std::set<Instruction *>();
-              curOUT[gen].insert(callInst);
+              addDefWithAlias(gen, callInst, curAliIN, curOUT);
             }
           }
-          // for all the other aliases, add the call instruction to their reaching definitions
-          // because it's possible that their values are changed by this call
-          if (gen)
-            for (auto *aliased : curAliOUT[gen])
-              curOUT[aliased].insert(callInst);
         }
         OUT[&I] = curOUT;
         curIN = curOUT;
@@ -296,15 +307,27 @@ namespace
         if (!(calledName.equals("CAT_add") || calledName.equals("CAT_sub")))
           continue;
 
+        IRBuilder<> builder(callInst);
+        Value *newOperand;
+
         // check if all the definitions of the operands that reach the call instruction are constant
         auto op1 = callInst->getOperand(1);
         auto op2 = callInst->getOperand(2);
+
+        // algebraic simplification of sub: x - x = 0
+        if (calledName.equals("CAT_sub") && op1 == op2)
+        {
+          newOperand = ConstantInt::get(Type::getInt64Ty(F.getContext()), 0);
+          builder.CreateCall(F.getParent()->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), newOperand}));
+          deleteList.push_back(callInst);
+          continue;
+        }
+        
+        // check the constantness of the operands
         auto *constant1 = getIfIsConstant(op1, IN[I]), *constant2 = getIfIsConstant(op2, IN[I]);
         if (!constant1 && !constant2)
           continue;
 
-        IRBuilder<> builder(callInst);
-        Value *newOperand;
         // if both operands are constant, constant fold
         if (constant1 && constant2)
           newOperand = calledName.equals("CAT_add") ? builder.CreateAdd(constant1, constant2) : builder.CreateSub(constant1, constant2);
