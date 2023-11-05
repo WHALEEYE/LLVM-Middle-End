@@ -12,6 +12,7 @@
 
 using namespace llvm;
 #define PASSED_IN nullptr
+#define NO_CACHE nullptr
 #define cout errs()
 
 namespace
@@ -20,8 +21,10 @@ namespace
   typedef std::map<Instruction *, RDASet> RDAMap;
   typedef std::map<Value *, std::set<Value *>> AliasSet;
   typedef std::map<Instruction *, AliasSet> AliasMap;
-  typedef std::unordered_set<Value *> StoredSet;
-  typedef std::map<Instruction *, StoredSet> StoredMap;
+  typedef std::unordered_set<Value *> EscapeSet;
+  typedef std::map<Instruction *, EscapeSet> EscapeMap;
+  typedef std::map<Value *, Value *> CacheSet;
+  typedef std::map<Instruction *, CacheSet> CacheMap;
 
   struct CAT : public FunctionPass
   {
@@ -29,11 +32,20 @@ namespace
 
     CAT() : FunctionPass(ID) {}
 
+    // sets for RDA
+    RDAMap IN, OUT;
+    AliasMap aliIN, aliOUT;
+    EscapeMap escIN, escOUT;
+    CacheMap cacheIN, cacheOUT;
+
+    Function *curFunc;
+    Module *curModule;
+
     // This function is invoked once at the initialization phase of the compiler
     // The LLVM IR of functions isn't ready at this point
     bool doInitialization(Module &M) override
     {
-      // errs() << "Hello LLVM World at \"doInitialization\"\n" ;
+      curModule = &M;
       return false;
     }
 
@@ -45,20 +57,22 @@ namespace
       curAliOUT[v].insert(v);
     }
 
-    void addDefWithAlias(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT)
+    void addDef(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT, CacheSet &curCacheOUT)
     {
-      for (auto *alias : aliases[v])
-        curOUT[alias].insert(def);
-
       curOUT[v].clear();
-      curOUT[v].insert(def);
+      for (auto *alias : aliases[v])
+      {
+        curOUT[alias].insert(def);
+        curCacheOUT[alias] = NO_CACHE;
+      }
     }
 
-    bool RDAinBB(BasicBlock &BB, RDAMap &IN, RDAMap &OUT, AliasMap &aliIN, AliasMap &aliOUT, StoredMap &stIN, StoredMap &stOUT)
+    bool RDAinBB(BasicBlock &BB)
     {
       RDASet curIN, curOUT;
       AliasSet curAliIN, curAliOUT;
-      StoredSet curStIN, curStOUT;
+      EscapeSet curEscIN, curEscOUT;
+      CacheSet curCacheIN, curCacheOUT;
       // create two temporary sets for comparing old OUT and new OUT
       std::unordered_set<Instruction *> oldOut, newOut;
       bool firstTime = true;
@@ -84,8 +98,8 @@ namespace
               curAliIN[pair.first].insert(I);
 
           // merge the store information
-          auto &predStOUT = stOUT[PB->getTerminator()];
-          curStIN.insert(predStOUT.begin(), predStOUT.end());
+          auto &predStOUT = escOUT[PB->getTerminator()];
+          curEscIN.insert(predStOUT.begin(), predStOUT.end());
         }
       else
         // if the block has no predecessors, then it's the entry block
@@ -94,6 +108,8 @@ namespace
         {
           curIN[&arg].clear();
           curIN[&arg].insert(PASSED_IN);
+          curAliIN[&arg].clear();
+          curAliIN[&arg].insert(&arg);
         }
 
       // calculate IN and OUT for each instruction in the current block
@@ -103,8 +119,10 @@ namespace
         curOUT = curIN;
         aliIN[&I] = curAliIN;
         curAliOUT = curAliIN;
-        stIN[&I] = curStIN;
-        curStOUT = curStIN;
+        escIN[&I] = curEscIN;
+        curEscOUT = curEscIN;
+        cacheIN[&I] = curCacheIN;
+        curCacheOUT = curCacheIN;
 
         // PHI
         if (I.getType()->isPointerTy() && isa<PHINode>(I))
@@ -166,25 +184,21 @@ namespace
         // STORE
         else if (auto *storeInst = dyn_cast<StoreInst>(&I))
         {
-          auto *ptr = storeInst->getPointerOperand();
           auto *val = storeInst->getValueOperand();
-          // put the saved value into store set
-          curStOUT.insert(val);
-          // add the store inst to RDA, just to mark that this is a second level pointer
-          curOUT[ptr].clear();
-          curOUT[ptr].insert(storeInst);
+          // put the saved value into escape set
+          curEscOUT.insert(val);
         }
         // LOAD
         else if (I.getType()->isPointerTy() && isa<LoadInst>(&I))
         {
           auto *loadInst = cast<LoadInst>(&I);
-          // all the variables in store set may be alias of this load instruction
+          // all the variables in escape set may be alias of this load instruction
           // clear RDA info and aliasing information
           resetAliasInfo(loadInst, curAliIN, curAliOUT);
           curOUT[loadInst].clear();
 
           // merge RDA info and aliasing information
-          for (auto *v : curStIN)
+          for (auto *v : curEscIN)
           {
             for (auto *alias : curAliIN[v])
             {
@@ -204,41 +218,63 @@ namespace
             gen = callInst;
             // reset the aliasing information
             resetAliasInfo(gen, curAliIN, curAliOUT);
-            curOUT[gen].clear();
-            curOUT[gen].insert(callInst);
+            addDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
           }
           else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
           {
             gen = callInst->getArgOperand(0);
-            addDefWithAlias(gen, callInst, curAliIN, curOUT);
+            addDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
           }
-          else if (!calledName.equals("CAT_get") && !calledName.equals("CAT_destroy") && !calledName.equals("printf"))
+          else if (calledName.equals("CAT_get"))
+          {
+            auto *data = callInst->getArgOperand(0);
+            // keep the earliest CAT_get as cache
+            if (curCacheOUT[data] == NO_CACHE)
+              curCacheOUT[data] = callInst;
+          }
+          else if (!calledName.equals("CAT_destroy") && !calledName.equals("printf") && !calledName.startswith("llvm.lifetime"))
           {
             // dealing with references that are passed into functions
             for (auto &op : callInst->operands())
             {
-              gen = op.get();
-
-              if (!gen->getType()->isPointerTy())
+              if (!op->getType()->isPointerTy())
                 continue;
 
-              if (curIN.find(gen) != curIN.end())
+              if (curIN.find(op) != curIN.end())
               {
-                curStOUT.insert(gen);
-                addDefWithAlias(gen, callInst, curAliIN, curOUT);
+                // escape the value
+                curEscOUT.insert(op);
+                addDef(op, callInst, curAliIN, curOUT, curCacheOUT);
               }
               else
-                for (auto *v : curStIN)
-                  addDefWithAlias(v, callInst, curAliIN, curOUT);
+                // may be a pointer to a CAT_data ref, regard this as alias of all the escaped values
+                for (auto *v : curEscIN)
+                  addDef(v, callInst, curAliIN, curOUT, curCacheOUT);
+            }
+
+            // if the function returns a pointer, then we consider it as the alias of all escaped values
+            if (callInst->getType()->isPointerTy())
+            {
+              gen = callInst;
+              resetAliasInfo(gen, curAliIN, curAliOUT);
+              for (auto *v : curEscIN)
+              {
+                curAliOUT[gen].insert(v);
+                curAliOUT[v].insert(gen);
+              }
+              addDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
             }
           }
         }
+
         OUT[&I] = curOUT;
         curIN = curOUT;
         aliOUT[&I] = curAliOUT;
         curAliIN = curAliOUT;
-        stOUT[&I] = curStOUT;
-        curStIN = curStOUT;
+        escOUT[&I] = curEscOUT;
+        curEscIN = curEscOUT;
+        cacheOUT[&I] = curCacheOUT;
+        curCacheIN = curCacheOUT;
       }
 
       // if the block is analyzed for the first time, then we need to add its successors to the queue
@@ -330,11 +366,11 @@ namespace
       return constant;
     }
 
-    bool constantFoldAndAlgSimp(Function &F, RDAMap &IN)
+    bool constantFoldAndAlgSimp()
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
-      for (auto &B : F)
+      for (auto &B : curFunc->getBasicBlockList())
         for (auto &I : B)
           instructions.push_back(&I);
 
@@ -359,8 +395,8 @@ namespace
         // algebraic simplification of sub: x - x = 0
         if (calledName.equals("CAT_sub") && op1 == op2)
         {
-          newOperand = ConstantInt::get(Type::getInt64Ty(F.getContext()), 0);
-          builder.CreateCall(F.getParent()->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), newOperand}));
+          newOperand = ConstantInt::get(Type::getInt64Ty(curFunc->getContext()), 0);
+          builder.CreateCall(curModule->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), newOperand}));
           deleteList.push_back(callInst);
           continue;
         }
@@ -375,14 +411,14 @@ namespace
           newOperand = calledName.equals("CAT_add") ? builder.CreateAdd(constant1, constant2) : builder.CreateSub(constant1, constant2);
         // if one of the operands is constant 0, then we can do the algebraic simplification
         else if (!constant1 && isa<ConstantInt>(constant2) && cast<ConstantInt>(constant2)->getValue() == 0)
-          newOperand = builder.CreateCall(F.getParent()->getFunction("CAT_get"), std::vector<Value *>({op1}));
+          newOperand = builder.CreateCall(curModule->getFunction("CAT_get"), std::vector<Value *>({op1}));
         else if (!constant2 && isa<ConstantInt>(constant1) && cast<ConstantInt>(constant1)->getValue() == 0 && calledName.equals("CAT_add"))
           // if the operation is CAT_sub and the second operand is not constant, then we can't simplify it because we need to do negation
-          newOperand = builder.CreateCall(F.getParent()->getFunction("CAT_get"), std::vector<Value *>({op2}));
+          newOperand = builder.CreateCall(curModule->getFunction("CAT_get"), std::vector<Value *>({op2}));
         else
           continue;
 
-        builder.CreateCall(F.getParent()->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), newOperand}));
+        builder.CreateCall(curModule->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), newOperand}));
         deleteList.push_back(callInst);
       }
       for (auto *I : deleteList)
@@ -391,11 +427,11 @@ namespace
       return deleteList.size() > 0;
     }
 
-    bool constantProp(Function &F, RDAMap &IN)
+    bool constantProp()
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
-      for (auto &B : F)
+      for (auto &B : curFunc->getBasicBlockList())
         for (auto &I : B)
           instructions.push_back(&I);
 
@@ -410,10 +446,24 @@ namespace
           continue;
 
         auto *constant = getIfIsConstant(callInst->getOperand(0), IN[I]);
-        if (!constant)
+
+        // first check if the data is constant
+        // if it is then we don't need to check the cache
+        if (constant)
+        {
+          callInst->replaceAllUsesWith(constant);
+          deleteList.push_back(callInst);
+          continue;
+        }
+
+        // if the data is already got and not modified, reuse
+        // only when the data is not constant, we try reuse it
+        // because only under this condition we can make sure the cache is not deleted
+        auto *cache = cacheIN[I][callInst->getOperand(0)];
+        if (cache == NO_CACHE)
           continue;
 
-        callInst->replaceAllUsesWith(constant);
+        callInst->replaceAllUsesWith(cache);
         deleteList.push_back(callInst);
       }
 
@@ -427,9 +477,7 @@ namespace
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction(Function &F) override
     {
-      RDAMap IN, OUT;
-      AliasMap aliIN, aliOUT;
-      StoredMap stIN, stOUT;
+      curFunc = &F;
       std::queue<BasicBlock *> toBeAnalyzed;
 
       // initialize the queue with all the blocks without predecessors
@@ -444,17 +492,17 @@ namespace
 
         // try to analyze the block
         // if the block is changed, add its successors to the queue
-        if (RDAinBB(*BB, IN, OUT, aliIN, aliOUT, stIN, stOUT))
+        if (RDAinBB(*BB))
           for (auto *suc : successors(BB))
             toBeAnalyzed.push(suc);
       }
 
-      dumpRDAInfo(F, IN, OUT);
+      // dumpRDAInfo(F, IN, OUT);
 
       bool changed = false;
 
-      changed |= constantFoldAndAlgSimp(F, IN);
-      changed |= constantProp(F, IN);
+      changed |= constantFoldAndAlgSimp();
+      changed |= constantProp();
 
       return changed;
     }
