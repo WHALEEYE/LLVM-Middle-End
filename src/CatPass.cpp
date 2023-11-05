@@ -12,6 +12,7 @@
 
 using namespace llvm;
 #define PASSED_IN nullptr
+#define cout errs()
 
 namespace
 {
@@ -19,7 +20,8 @@ namespace
   typedef std::map<Instruction *, RDASet> RDAMap;
   typedef std::map<Value *, std::set<Value *>> AliasSet;
   typedef std::map<Instruction *, AliasSet> AliasMap;
-  typedef std::map<Instruction *, bool> DCEMap;
+  typedef std::unordered_set<Value *> StoredSet;
+  typedef std::map<Instruction *, StoredSet> StoredMap;
 
   struct CAT : public FunctionPass
   {
@@ -52,13 +54,13 @@ namespace
       curOUT[v].insert(def);
     }
 
-    bool RDAinBB(BasicBlock &BB, RDAMap &IN, RDAMap &OUT, AliasMap &aliIN, AliasMap &aliOUT)
+    bool RDAinBB(BasicBlock &BB, RDAMap &IN, RDAMap &OUT, AliasMap &aliIN, AliasMap &aliOUT, StoredMap &stIN, StoredMap &stOUT)
     {
       RDASet curIN, curOUT;
       AliasSet curAliIN, curAliOUT;
+      StoredSet curStIN, curStOUT;
       // create two temporary sets for comparing old OUT and new OUT
       std::unordered_set<Instruction *> oldOut, newOut;
-      AliasSet oldAliOUT, newAliOUT;
       bool firstTime = true;
 
       firstTime = OUT.find(BB.getTerminator()) == OUT.end();
@@ -66,8 +68,6 @@ namespace
       for (auto &pair : OUT[BB.getTerminator()])
         for (auto *I : pair.second)
           oldOut.insert(I);
-      // also store the aliasing information
-      oldAliOUT = aliOUT[BB.getTerminator()];
 
       // merge the predecessors' information
       if (!predecessors(&BB).empty())
@@ -82,6 +82,10 @@ namespace
           for (auto &pair : aliOUT[PB->getTerminator()])
             for (auto *I : pair.second)
               curAliIN[pair.first].insert(I);
+
+          // merge the store information
+          auto &predStOUT = stOUT[PB->getTerminator()];
+          curStIN.insert(predStOUT.begin(), predStOUT.end());
         }
       else
         // if the block has no predecessors, then it's the entry block
@@ -99,6 +103,8 @@ namespace
         curOUT = curIN;
         aliIN[&I] = curAliIN;
         curAliOUT = curAliIN;
+        stIN[&I] = curStIN;
+        curStOUT = curStIN;
 
         // PHI
         if (I.getType()->isPointerTy() && isa<PHINode>(I))
@@ -154,8 +160,38 @@ namespace
               curAliOUT[selectInst].insert(alias);
               curAliOUT[alias].insert(selectInst);
             }
-            std::set<Instruction *> reachingDefs = curIN[op];
-            curOUT[selectInst].insert(reachingDefs.begin(), reachingDefs.end());
+            curOUT[selectInst].insert(curIN[op].begin(), curIN[op].end());
+          }
+        }
+        // STORE
+        else if (auto *storeInst = dyn_cast<StoreInst>(&I))
+        {
+          auto *ptr = storeInst->getPointerOperand();
+          auto *val = storeInst->getValueOperand();
+          // put the saved value into store set
+          curStOUT.insert(val);
+          // add the store inst to RDA, just to mark that this is a second level pointer
+          curOUT[ptr].clear();
+          curOUT[ptr].insert(storeInst);
+        }
+        // LOAD
+        else if (I.getType()->isPointerTy() && isa<LoadInst>(&I))
+        {
+          auto *loadInst = cast<LoadInst>(&I);
+          // all the variables in store set may be alias of this load instruction
+          // clear RDA info and aliasing information
+          resetAliasInfo(loadInst, curAliIN, curAliOUT);
+          curOUT[loadInst].clear();
+
+          // merge RDA info and aliasing information
+          for (auto *v : curStIN)
+          {
+            for (auto *alias : curAliIN[v])
+            {
+              curAliOUT[loadInst].insert(alias);
+              curAliOUT[alias].insert(loadInst);
+            }
+            curOUT[loadInst].insert(curIN[v].begin(), curIN[v].end());
           }
         }
         // assignment to CAT_data
@@ -182,9 +218,18 @@ namespace
             for (auto &op : callInst->operands())
             {
               gen = op.get();
+
               if (!gen->getType()->isPointerTy())
                 continue;
-              addDefWithAlias(gen, callInst, curAliIN, curOUT);
+
+              if (curIN.find(gen) != curIN.end())
+              {
+                curStOUT.insert(gen);
+                addDefWithAlias(gen, callInst, curAliIN, curOUT);
+              }
+              else
+                for (auto *v : curStIN)
+                  addDefWithAlias(v, callInst, curAliIN, curOUT);
             }
           }
         }
@@ -192,6 +237,8 @@ namespace
         curIN = curOUT;
         aliOUT[&I] = curAliOUT;
         curAliIN = curAliOUT;
+        stOUT[&I] = curStOUT;
+        curStIN = curStOUT;
       }
 
       // if the block is analyzed for the first time, then we need to add its successors to the queue
@@ -203,9 +250,7 @@ namespace
         for (auto *I : pair.second)
           newOut.insert(I);
 
-      newAliOUT = aliOUT[BB.getTerminator()];
-
-      if (oldOut.size() != newOut.size() || oldAliOUT.size() != newAliOUT.size())
+      if (oldOut.size() != newOut.size())
         return true;
 
       for (auto *I : oldOut)
@@ -213,41 +258,38 @@ namespace
         if (newOut.find(I) == newOut.end())
           return true;
 
-      // compare the aliasing information
-      for (auto &pair : oldAliOUT)
-        if (newAliOUT.find(pair.first) == newAliOUT.end())
-          return true;
-        else
-          for (auto *I : pair.second)
-            if (newAliOUT[pair.first].find(I) == newAliOUT[pair.first].end())
-              return true;
-
       // the block is not changed if the two sets are equal
       return false;
     }
 
-    void printRDAResult(Function &F, RDAMap &IN, RDAMap &OUT)
+    void dumpRDAInfo(Function &F, RDAMap &IN, RDAMap &OUT)
     {
-      errs() << "Function \"" << F.getName() << "\"\n";
+      cout << "Function \"" << F.getName() << "\"\n";
       for (auto &pair : IN)
       {
-        errs() << "INSTRUCTION:   " << *pair.first << "\n***************** IN\n{\n";
+        cout << "INSTRUCTION: " << *pair.first << "\n***************** IN\n{\n";
 
         for (auto &defPair : pair.second)
+        {
+          cout << "DEF OF " << *defPair.first << ":\n";
           for (auto *I : defPair.second)
             if (I)
-              errs() << *I << "\n";
+              cout << "  " << *I << "\n";
             else
-              errs() << "Argument\n";
+              cout << "  Argument\n";
+        }
 
-        errs() << "}\n**************************************\n***************** OUT\n{\n";
+        cout << "}\n**************************************\n***************** OUT\n{\n";
 
         for (auto &defPair : OUT[pair.first])
+        {
+          cout << "DEF OF " << *defPair.first << ":\n";
           for (auto *I : defPair.second)
             if (I)
-              errs() << *I << "\n";
+              cout << "  " << *I << "\n";
             else
-              errs() << "Argument\n";
+              cout << "  Argument\n";
+        }
 
         errs() << "}\n**************************************\n";
       }
@@ -288,7 +330,7 @@ namespace
       return constant;
     }
 
-    bool constantFoldAndAlgSimp(Function &F, RDAMap &IN, AliasMap &aliIN)
+    bool constantFoldAndAlgSimp(Function &F, RDAMap &IN)
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
@@ -322,7 +364,7 @@ namespace
           deleteList.push_back(callInst);
           continue;
         }
-        
+
         // check the constantness of the operands
         auto *constant1 = getIfIsConstant(op1, IN[I]), *constant2 = getIfIsConstant(op2, IN[I]);
         if (!constant1 && !constant2)
@@ -349,7 +391,7 @@ namespace
       return deleteList.size() > 0;
     }
 
-    bool constantProp(Function &F, RDAMap &IN, AliasMap &aliIN)
+    bool constantProp(Function &F, RDAMap &IN)
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
@@ -381,72 +423,13 @@ namespace
       return deleteList.size() > 0;
     }
 
-    bool deadCodeEli(Function &F, RDAMap &IN)
-    {
-      std::vector<CallInst *> deleteList;
-      std::vector<Instruction *> instructions;
-      DCEMap dceMap;
-      for (auto &B : F)
-        for (auto &I : B)
-        {
-          instructions.push_back(&I);
-          if (!isa<CallInst>(I))
-            continue;
-          auto *callInst = cast<CallInst>(&I);
-          auto calledName = callInst->getCalledFunction()->getName();
-          // register the call instruction if it is a CAT_add, CAT_sub or CAT_set, which may be deleted by DCE
-          // DCE won't eliminate CAT_new and CAT_get
-          // DCE won't eliminate CAT_add, CAT_sub and CAT_set if the first operand is an argument
-          if ((calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set")) && !isa<Argument>(callInst->getArgOperand(0)))
-            dceMap[callInst] = false;
-        }
-
-      for (auto *I : instructions)
-      {
-        // check dependencies of the call instruction if it's a CAT_add, CAT_sub or CAT_get
-        if (!isa<CallInst>(I))
-          continue;
-        auto *callInst = cast<CallInst>(I);
-        auto calledName = callInst->getCalledFunction()->getName();
-
-        if (calledName.equals("CAT_add") || calledName.equals("CAT_sub"))
-        {
-          auto *op1 = callInst->getOperand(1), *op2 = callInst->getOperand(2);
-          // mark the def of the operands (only ones registered in map) as alive
-          for (auto *def : IN[I][op1])
-            if (dceMap.find(def) != dceMap.end())
-              dceMap[def] = true;
-          for (auto *def : IN[I][op2])
-            if (dceMap.find(def) != dceMap.end())
-              dceMap[def] = true;
-        }
-        else if (calledName.equals("CAT_get"))
-        {
-          for (auto *def : IN[I][callInst->getOperand(0)])
-            if (dceMap.find(def) != dceMap.end())
-              dceMap[def] = true;
-        }
-        else
-          continue;
-      }
-
-      bool changed = false;
-      // delete the call instructions that are registered and marked as dead
-      for (auto &pair : dceMap)
-        if (!pair.second)
-        {
-          changed = true;
-          pair.first->eraseFromParent();
-        }
-      return changed;
-    }
-
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction(Function &F) override
     {
       RDAMap IN, OUT;
       AliasMap aliIN, aliOUT;
+      StoredMap stIN, stOUT;
       std::queue<BasicBlock *> toBeAnalyzed;
 
       // initialize the queue with all the blocks without predecessors
@@ -461,22 +444,17 @@ namespace
 
         // try to analyze the block
         // if the block is changed, add its successors to the queue
-        if (RDAinBB(*BB, IN, OUT, aliIN, aliOUT))
+        if (RDAinBB(*BB, IN, OUT, aliIN, aliOUT, stIN, stOUT))
           for (auto *suc : successors(BB))
             toBeAnalyzed.push(suc);
       }
-      // printRDAResult(F, IN, OUT);
+
+      dumpRDAInfo(F, IN, OUT);
 
       bool changed = false;
 
-      changed |= constantFoldAndAlgSimp(F, IN, aliIN);
-      changed |= constantProp(F, IN, aliIN);
-
-      // to avoid all CAT_set being eliminated by DCE (so the signature will also be killed)
-      // we only do DCE when there is no further constant optimization
-      // DCE will not bring new optimization points to fold and propagation
-      // if (!changed)
-      //   changed |= deadCodeEli(F, IN);
+      changed |= constantFoldAndAlgSimp(F, IN);
+      changed |= constantProp(F, IN);
 
       return changed;
     }
