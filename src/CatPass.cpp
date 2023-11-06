@@ -52,6 +52,37 @@ namespace
       return false;
     }
 
+    void resetGlobalMaps()
+    {
+      IN.clear();
+      OUT.clear();
+      aliIN.clear();
+      aliOUT.clear();
+      escIN.clear();
+      escOUT.clear();
+      cacheIN.clear();
+      cacheOUT.clear();
+    }
+
+    int getSize(Value *ptr)
+    {
+      auto *ptrType = cast<PointerType>(ptr->getType())->getPointerElementType();
+      return ptrType->isSized() ? curModule->getDataLayout().getTypeStoreSize(ptrType) : 0;
+    }
+
+    bool mayModifiedByFunc(CallInst *callInst, Value *ptr)
+    {
+      switch (AA->getModRefInfo(callInst, ptr, getSize(ptr)))
+      {
+      case ModRefInfo::Mod:
+      case ModRefInfo::ModRef:
+      case ModRefInfo::MustMod:
+        return true;
+      default:
+        return false;
+      }
+    }
+
     void resetAliasInfo(Value *v, AliasSet &curAliIN, AliasSet &curAliOUT)
     {
       for (auto *alias : curAliIN[v])
@@ -238,66 +269,52 @@ namespace
           else if (!calledName.equals("CAT_destroy") && !calledName.equals("printf") && !calledName.startswith("llvm.lifetime"))
           {
             // dealing with references that are passed into functions
-            // 1. check all arguments to see if they are modified. If yes, add def to RDA ()
-            // 2. escape all arguments (modifies the escape set)
-            // 3. check if the function returns a pointer. If yes, check if they can be alias of escaped values. If yes, merge the info
-            //    in this step, we should use RDA OUT and escape OUT
+            // 1. check all arguments to see if they are modified. If yes, add def to RDA (modifies RDA set)
+            // 2. (when function returns a ptr) check the return value to see if it aliases with any of the arguments (do this when checking arguments)
+            //    if yes, merge
+            // 3. escape all arguments (modifies escape set)
+            int rtnSize = -1;
+            bool rtnPtr = callInst->getType()->isPointerTy();
+            if (rtnPtr)
+            {
+              resetAliasInfo(callInst, curAliIN, curAliOUT);
+              curOUT[callInst].clear();
+              rtnSize = getSize(callInst);
+            }
+
             for (auto &op : callInst->operands())
             {
               if (!op->getType()->isPointerTy())
                 continue;
 
-              auto *eleType = cast<PointerType>(op->getType())->getPointerElementType();
-              int size = eleType->isSized() ? curModule->getDataLayout().getTypeStoreSize(eleType) : 0;
-
               if (curIN.find(op) != curIN.end())
               {
                 curEscOUT.insert(op);
                 // if modified, add def to RDA
-                switch (AA->getModRefInfo(callInst, op, size))
-                {
-                case ModRefInfo::Mod:
-                case ModRefInfo::ModRef:
-                case ModRefInfo::MustMod:
+                if (mayModifiedByFunc(callInst, op))
                   addDef(op, callInst, curAliIN, curOUT, curCacheOUT);
-                  break;
-                default:
-                  break;
+                if (rtnPtr && AA->alias(callInst, rtnSize, op, getSize(op)) != AliasResult::NoAlias)
+                {
+                  curAliOUT[callInst].insert(op);
+                  curAliOUT[op].insert(callInst);
+                  curOUT[callInst].insert(curOUT[op].begin(), curOUT[op].end());
                 }
               }
               else
+              {
                 // may be a pointer to a CAT_data ref, check all the escaped values with AA to determine
                 for (auto *v : curEscIN)
-                  switch (AA->getModRefInfo(callInst, v, size))
-                  {
-                  case ModRefInfo::Mod:
-                  case ModRefInfo::ModRef:
-                  case ModRefInfo::MustMod:
+                {
+                  if (mayModifiedByFunc(callInst, v))
                     addDef(v, callInst, curAliIN, curOUT, curCacheOUT);
-                    break;
-                  default:
-                    break;
+
+                  if (rtnPtr && AA->alias(callInst, rtnSize, v, getSize(v)) != AliasResult::NoAlias)
+                  {
+                    curAliOUT[callInst].insert(v);
+                    curAliOUT[v].insert(callInst);
+                    curOUT[callInst].insert(curOUT[v].begin(), curOUT[v].end());
                   }
-            }
-
-            // if the function returns a pointer, it may be the alias of escaped values
-            // use LLVM AA to check
-            if (callInst->getType()->isPointerTy())
-            {
-              auto *rtnType = cast<PointerType>(callInst->getType())->getPointerElementType();
-              int rtnSize = rtnType->isSized() ? curModule->getDataLayout().getTypeStoreSize(rtnType) : 0;
-
-              gen = callInst;
-              resetAliasInfo(gen, curAliIN, curAliOUT);
-              for (auto *v : curEscIN)
-              {
-                auto *argType = cast<PointerType>(v->getType())->getPointerElementType();
-                int argSize = argType->isSized() ? curModule->getDataLayout().getTypeStoreSize(argType) : 0;
-                if (AA->alias(callInst, rtnSize, v, argSize) == AliasResult::NoAlias)
-                  continue;
-                curAliOUT[gen].insert(v);
-                curAliOUT[v].insert(gen);
-                curOUT[gen].insert(curOUT[v].begin(), curOUT[v].end());
+                }
               }
             }
           }
@@ -334,9 +351,9 @@ namespace
       return false;
     }
 
-    void dumpRDAInfo(Function &F, RDAMap &IN, RDAMap &OUT)
+    void dumpRDAInfo()
     {
-      cout << "Function \"" << F.getName() << "\"\n";
+      cout << "Function \"" << curFunc->getName() << "\"\n";
       for (auto &pair : IN)
       {
         cout << "INSTRUCTION: " << *pair.first << "\n***************** IN\n{\n";
@@ -513,6 +530,7 @@ namespace
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction(Function &F) override
     {
+      resetGlobalMaps();
       curFunc = &F;
       AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
 
@@ -535,7 +553,7 @@ namespace
             toBeAnalyzed.push(suc);
       }
 
-      // dumpRDAInfo(F, IN, OUT);
+      // dumpRDAInfo();
 
       bool changed = false;
 
