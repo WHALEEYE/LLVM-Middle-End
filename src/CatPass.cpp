@@ -3,6 +3,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
 #include <map>
@@ -40,6 +41,8 @@ namespace
 
     Function *curFunc;
     Module *curModule;
+
+    AliasAnalysis *AA;
 
     // This function is invoked once at the initialization phase of the compiler
     // The LLVM IR of functions isn't ready at this point
@@ -235,34 +238,67 @@ namespace
           else if (!calledName.equals("CAT_destroy") && !calledName.equals("printf") && !calledName.startswith("llvm.lifetime"))
           {
             // dealing with references that are passed into functions
+            // 1. check all arguments to see if they are modified. If yes, add def to RDA ()
+            // 2. escape all arguments (modifies the escape set)
+            // 3. check if the function returns a pointer. If yes, check if they can be alias of escaped values. If yes, merge the info
+            //    in this step, we should use RDA OUT and escape OUT
             for (auto &op : callInst->operands())
             {
               if (!op->getType()->isPointerTy())
                 continue;
 
+              auto *eleType = cast<PointerType>(op->getType())->getPointerElementType();
+              int size = eleType->isSized() ? curModule->getDataLayout().getTypeStoreSize(eleType) : 0;
+
               if (curIN.find(op) != curIN.end())
               {
-                // escape the value
                 curEscOUT.insert(op);
-                addDef(op, callInst, curAliIN, curOUT, curCacheOUT);
+                // if modified, add def to RDA
+                switch (AA->getModRefInfo(callInst, op, size))
+                {
+                case ModRefInfo::Mod:
+                case ModRefInfo::ModRef:
+                case ModRefInfo::MustMod:
+                  addDef(op, callInst, curAliIN, curOUT, curCacheOUT);
+                  break;
+                default:
+                  break;
+                }
               }
               else
-                // may be a pointer to a CAT_data ref, regard this as alias of all the escaped values
+                // may be a pointer to a CAT_data ref, check all the escaped values with AA to determine
                 for (auto *v : curEscIN)
-                  addDef(v, callInst, curAliIN, curOUT, curCacheOUT);
+                  switch (AA->getModRefInfo(callInst, v, size))
+                  {
+                  case ModRefInfo::Mod:
+                  case ModRefInfo::ModRef:
+                  case ModRefInfo::MustMod:
+                    addDef(v, callInst, curAliIN, curOUT, curCacheOUT);
+                    break;
+                  default:
+                    break;
+                  }
             }
 
-            // if the function returns a pointer, then we consider it as the alias of all escaped values
+            // if the function returns a pointer, it may be the alias of escaped values
+            // use LLVM AA to check
             if (callInst->getType()->isPointerTy())
             {
+              auto *rtnType = cast<PointerType>(callInst->getType())->getPointerElementType();
+              int rtnSize = rtnType->isSized() ? curModule->getDataLayout().getTypeStoreSize(rtnType) : 0;
+
               gen = callInst;
               resetAliasInfo(gen, curAliIN, curAliOUT);
               for (auto *v : curEscIN)
               {
+                auto *argType = cast<PointerType>(v->getType())->getPointerElementType();
+                int argSize = argType->isSized() ? curModule->getDataLayout().getTypeStoreSize(argType) : 0;
+                if (AA->alias(callInst, rtnSize, v, argSize) == AliasResult::NoAlias)
+                  continue;
                 curAliOUT[gen].insert(v);
                 curAliOUT[v].insert(gen);
+                curOUT[gen].insert(curOUT[v].begin(), curOUT[v].end());
               }
-              addDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
             }
           }
         }
@@ -478,6 +514,8 @@ namespace
     bool runOnFunction(Function &F) override
     {
       curFunc = &F;
+      AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
+
       std::queue<BasicBlock *> toBeAnalyzed;
 
       // initialize the queue with all the blocks without predecessors
@@ -510,6 +548,7 @@ namespace
     // The LLVM IR of functions isn't ready at this point
     void getAnalysisUsage(AnalysisUsage &AU) const override
     {
+      AU.addRequired<AAResultsWrapperPass>();
       // nothing is preserved, so we don't need to do anything here
     }
   };
