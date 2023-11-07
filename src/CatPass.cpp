@@ -261,10 +261,10 @@ namespace
           }
           else if (calledName.equals("CAT_get"))
           {
-            // auto *data = callInst->getArgOperand(0);
-            // // keep the earliest CAT_get as cache
-            // if (curCacheOUT[data] == NO_CACHE)
-            //   curCacheOUT[data] = callInst;
+            auto *data = callInst->getArgOperand(0);
+            // keep the earliest CAT_get as cache
+            if (curCacheOUT[data] == NO_CACHE)
+              curCacheOUT[data] = callInst;
           }
           else if (!calledName.equals("CAT_destroy") && !calledName.equals("printf") && !calledName.startswith("llvm.lifetime"))
           {
@@ -512,12 +512,12 @@ namespace
         // if the data is already got and not modified, reuse
         // only when the data is not constant, we try reuse it
         // because only under this condition we can make sure the cache is not deleted
-        // auto *cache = cacheIN[I][callInst->getOperand(0)];
-        // if (cache == NO_CACHE)
-        //   continue;
+        auto *cache = cacheIN[I][callInst->getOperand(0)];
+        if (cache == NO_CACHE)
+          continue;
 
-        // callInst->replaceAllUsesWith(cache);
-        // deleteList.push_back(callInst);
+        callInst->replaceAllUsesWith(cache);
+        deleteList.push_back(callInst);
       }
 
       for (auto I : deleteList)
