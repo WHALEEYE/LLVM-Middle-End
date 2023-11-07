@@ -12,7 +12,7 @@
 #include <queue>
 
 using namespace llvm;
-#define PASSED_IN nullptr
+#define UNKNOWN nullptr
 #define NO_CACHE nullptr
 #define cout errs()
 
@@ -35,7 +35,7 @@ namespace
 
     // sets for RDA
     RDAMap IN, OUT;
-    AliasMap aliIN, aliOUT;
+    AliasMap aliIN, aliOUT, ptIN, ptOUT;
     EscapeMap escIN, escOUT;
     CacheMap cacheIN, cacheOUT;
 
@@ -58,6 +58,8 @@ namespace
       OUT.clear();
       aliIN.clear();
       aliOUT.clear();
+      ptIN.clear();
+      ptOUT.clear();
       escIN.clear();
       escOUT.clear();
       cacheIN.clear();
@@ -91,9 +93,14 @@ namespace
       curAliOUT[v].insert(v);
     }
 
-    void addDef(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT, CacheSet &curCacheOUT)
+    void setDef(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT, CacheSet &curCacheOUT)
     {
       curOUT[v].clear();
+      if (aliases.find(v) == aliases.end())
+      {
+        cout << "WARNING: " << *v << " alias not init!\n";
+        aliases[v].insert(v);
+      }
       for (auto *alias : aliases[v])
       {
         curOUT[alias].insert(def);
@@ -101,10 +108,39 @@ namespace
       }
     }
 
+    void addRela(Value *ptr, Value *value, AliasSet &aliases, AliasSet &curPtOUT)
+    {
+      if (aliases.find(ptr) == aliases.end())
+      {
+        cout << "WARNING: " << *ptr << " alias not init!\n";
+        aliases[ptr].insert(ptr);
+      }
+
+      for (auto *alias : aliases[ptr])
+        curPtOUT[alias].insert(value);
+    }
+
+    std::set<Value *> findAllPossibleCATRef(Value *ptr, AliasSet &curPtIN)
+    {
+      std::set<Value *> possibleCATRef;
+      for (auto *child : curPtIN[ptr])
+        if (child == UNKNOWN)
+          possibleCATRef.insert(UNKNOWN);
+        else if (curPtIN.find(child) == curPtIN.end())
+          possibleCATRef.insert(child);
+        else
+        {
+          auto possibleChildCATRef = findAllPossibleCATRef(child, curPtIN);
+          possibleCATRef.insert(possibleChildCATRef.begin(), possibleChildCATRef.end());
+        }
+
+      return possibleCATRef;
+    }
+
     bool RDAinBB(BasicBlock &BB)
     {
       RDASet curIN, curOUT;
-      AliasSet curAliIN, curAliOUT;
+      AliasSet curAliIN, curAliOUT, curPtIN, curPtOUT;
       EscapeSet curEscIN, curEscOUT;
       CacheSet curCacheIN, curCacheOUT;
       // create two temporary sets for comparing old OUT and new OUT
@@ -141,7 +177,7 @@ namespace
         for (auto &arg : BB.getParent()->args())
         {
           curIN[&arg].clear();
-          curIN[&arg].insert(PASSED_IN);
+          curIN[&arg].insert(UNKNOWN);
           curAliIN[&arg].clear();
           curAliIN[&arg].insert(&arg);
         }
@@ -153,6 +189,8 @@ namespace
         curOUT = curIN;
         aliIN[&I] = curAliIN;
         curAliOUT = curAliIN;
+        ptIN[&I] = curPtIN;
+        curPtOUT = curPtIN;
         escIN[&I] = curEscIN;
         curEscOUT = curEscIN;
         cacheIN[&I] = curCacheIN;
@@ -215,34 +253,53 @@ namespace
             curOUT[selectInst].insert(curIN[op].begin(), curIN[op].end());
           }
         }
-        // STORE
+        else if (auto *allocaInst = dyn_cast<AllocaInst>(&I))
+        {
+          resetAliasInfo(allocaInst, curAliIN, curAliOUT);
+          curOUT[allocaInst].clear();
+        }
+        // STORE: add relationship
         else if (auto *storeInst = dyn_cast<StoreInst>(&I))
         {
           auto *val = storeInst->getValueOperand();
-          // put the saved value into escape set
-          curEscOUT.insert(val);
+          auto *ptr = storeInst->getPointerOperand();
+          // all the current refs are killed
+          curPtOUT[ptr].clear();
+          // add relationship to all the alias
+          addRela(ptr, val, curAliIN, curPtOUT);
         }
         // LOAD
         else if (I.getType()->isPointerTy() && isa<LoadInst>(&I))
         {
           auto *loadInst = cast<LoadInst>(&I);
-          // all the variables in escape set may be alias of this load instruction
-          // clear RDA info and aliasing information
+          auto *ptr = loadInst->getPointerOperand();
+
+          // if the ptr is not registered, then its content is unknown
+          if (curPtIN.find(ptr) == curPtIN.end())
+            curPtIN[ptr].insert(UNKNOWN);
+
+          // add a new relationship
+          addRela(ptr, loadInst, curAliIN, curPtOUT);
+
+          // reset for loaded value
           resetAliasInfo(loadInst, curAliIN, curAliOUT);
           curOUT[loadInst].clear();
 
-          // merge RDA info and aliasing information
-          for (auto *v : curEscIN)
+          // merge the info of the pointer
+          for (auto *value : curPtIN[ptr])
           {
-            for (auto *alias : curAliIN[v])
+            if (value == UNKNOWN)
             {
-              curAliOUT[loadInst].insert(alias);
-              curAliOUT[alias].insert(loadInst);
+              curOUT[loadInst].insert(UNKNOWN);
+              continue;
             }
-            curOUT[loadInst].insert(curIN[v].begin(), curIN[v].end());
+
+            curAliOUT[loadInst].insert(value);
+            curAliOUT[value].insert(loadInst);
+            curOUT[loadInst].insert(curIN[value].begin(), curIN[value].end());
           }
         }
-        // assignment to CAT_data
+        // CAT OP: changes RDA of the first operand
         else if (auto *callInst = dyn_cast<CallInst>(&I))
         {
           Value *gen = nullptr;
@@ -252,13 +309,14 @@ namespace
             gen = callInst;
             // reset the aliasing information
             resetAliasInfo(gen, curAliIN, curAliOUT);
-            addDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
+            setDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
           }
           else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
           {
             gen = callInst->getArgOperand(0);
-            addDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
+            setDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
           }
+          // CAT_get: affects the CACHE of get
           else if (calledName.equals("CAT_get"))
           {
             auto *data = callInst->getArgOperand(0);
@@ -266,6 +324,7 @@ namespace
             if (curCacheOUT[data] == NO_CACHE)
               curCacheOUT[data] = callInst;
           }
+          // MISC FUNC
           else if (!calledName.equals("CAT_destroy") && !calledName.equals("printf") && !calledName.startswith("llvm.lifetime"))
           {
             // dealing with references that are passed into functions
@@ -292,7 +351,7 @@ namespace
                 curEscOUT.insert(op);
                 // if modified, add def to RDA
                 if (mayModifiedByFunc(callInst, op))
-                  addDef(op, callInst, curAliIN, curOUT, curCacheOUT);
+                  setDef(op, callInst, curAliIN, curOUT, curCacheOUT);
                 if (rtnPtr && AA->alias(callInst, rtnSize, op, getSize(op)) != AliasResult::NoAlias)
                 {
                   curAliOUT[callInst].insert(op);
@@ -306,7 +365,7 @@ namespace
                 for (auto *v : curEscIN)
                 {
                   if (mayModifiedByFunc(callInst, v))
-                    addDef(v, callInst, curAliIN, curOUT, curCacheOUT);
+                    setDef(v, callInst, curAliIN, curOUT, curCacheOUT);
 
                   if (rtnPtr && AA->alias(callInst, rtnSize, v, getSize(v)) != AliasResult::NoAlias)
                   {
@@ -324,6 +383,8 @@ namespace
         curIN = curOUT;
         aliOUT[&I] = curAliOUT;
         curAliIN = curAliOUT;
+        ptOUT[&I] = curPtOUT;
+        curPtIN = curPtOUT;
         escOUT[&I] = curEscOUT;
         curEscIN = curEscOUT;
         cacheOUT[&I] = curCacheOUT;
@@ -390,8 +451,8 @@ namespace
 
       for (auto *def : curIN[operand])
       {
-        // def may be PASSED_IN, which means the operand may be defined outside the function
-        if (def == PASSED_IN)
+        // def may be UNKNOWN, which means the operand may be defined outside the function
+        if (def == UNKNOWN)
           return nullptr;
 
         Value *candidate = nullptr;
@@ -553,7 +614,7 @@ namespace
             toBeAnalyzed.push(suc);
       }
 
-      // dumpRDAInfo();
+      dumpRDAInfo();
 
       bool changed = false;
 
