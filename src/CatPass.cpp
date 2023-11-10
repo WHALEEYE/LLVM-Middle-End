@@ -95,6 +95,19 @@ namespace
       }
     }
 
+    bool mayReferencedByFunc(CallInst *callInst, Value *ptr)
+    {
+      switch (AA->getModRefInfo(callInst, ptr, getSize(ptr)))
+      {
+      case ModRefInfo::Ref:
+      case ModRefInfo::ModRef:
+      case ModRefInfo::MustRef:
+        return true;
+      default:
+        return false;
+      }
+    }
+
     void mergeAliasInfo(Value *source, Value *target, AliasSet &curAliIN, AliasSet &curAliOUT)
     {
       for (auto *alias : curAliIN[source])
@@ -163,30 +176,30 @@ namespace
 
     std::set<Value *> findAllPossibleCATData(Value *ptr, AliasSet &curPtIN)
     {
-      std::set<Value *> possibleCATRef;
+      std::set<Value *> possibleCATData;
       for (auto *pointed : curPtIN[ptr])
       {
         if (pointed == UNKNOWN)
         {
-          possibleCATRef.insert(UNKNOWN);
+          possibleCATData.insert(UNKNOWN);
           continue;
         }
 
         switch (checkType(pointed))
         {
         case CAT_DATA:
-          possibleCATRef.insert(pointed);
+          possibleCATData.insert(pointed);
           break;
         case OTHER:
           break;
         case CAT_PTR:
           auto rst = findAllPossibleCATData(pointed, curPtIN);
-          possibleCATRef.insert(rst.begin(), rst.end());
+          possibleCATData.insert(rst.begin(), rst.end());
           break;
         }
       }
 
-      return possibleCATRef;
+      return possibleCATData;
     }
 
     void collectTypeInfo()
@@ -199,6 +212,63 @@ namespace
         if (!fixed)
           break;
       }
+
+      // sweep the type info in the whole function
+      sweepTypeInfoInBB();
+    }
+
+    void sortAccordingToType(Value *v)
+    {
+      if (!v->getType()->isPointerTy() || checkType(v) != OTHER)
+        return;
+      auto *ptrType = cast<PointerType>(v->getType());
+      if (ptrType->getPointerElementType()->isIntegerTy(8))
+        allCATData.insert(v);
+      else
+        allCATPtr.insert(v);
+    }
+
+    void sweepTypeInfoInBB()
+    {
+      // sweep globals
+      for (auto &GV : curModule->globals())
+        if (auto *ptrType = dyn_cast<PointerType>(GV.getType()))
+        {
+          if (checkType(&GV) != OTHER)
+            continue;
+          if (ptrType->getPointerElementType()->isIntegerTy(8))
+            allCATData.insert(&GV);
+          else
+            allCATPtr.insert(&GV);
+        }
+
+      for (auto &BB : *curFunc)
+        for (auto &I : BB)
+        {
+          if (auto *allocaInst = dyn_cast<AllocaInst>(&I))
+            sortAccordingToType(allocaInst);
+          else if (auto *phiNode = dyn_cast<PHINode>(&I))
+            sortAccordingToType(phiNode);
+          else if (auto *selectInst = dyn_cast<SelectInst>(&I))
+            sortAccordingToType(selectInst);
+          else if (auto *storeInst = dyn_cast<StoreInst>(&I))
+          {
+            sortAccordingToType(storeInst->getPointerOperand());
+            sortAccordingToType(storeInst->getValueOperand());
+          }
+          else if (auto *loadInst = dyn_cast<LoadInst>(&I))
+          {
+            sortAccordingToType(loadInst->getPointerOperand());
+            sortAccordingToType(loadInst);
+          }
+          else if (auto *bitcastInst = dyn_cast<BitCastInst>(&I))
+          {
+            sortAccordingToType(bitcastInst);
+            sortAccordingToType(bitcastInst->getOperand(0));
+          }
+          else if (auto *callInst = dyn_cast<CallInst>(&I))
+            sortAccordingToType(callInst);
+        }
     }
 
     bool collectTypeInfoInBB(BasicBlock &BB)
@@ -550,6 +620,30 @@ namespace
           else
             cout << "[WARNING] In " << *loadInst << " the ptr is not recognized\n";
         }
+        // BITCAST: add alias info
+        else if (auto *bitcastInst = dyn_cast<BitCastInst>(&I))
+        {
+          auto *casted = bitcastInst->getOperand(0);
+          resetAliasInfo(bitcastInst, curAliIN, curAliOUT);
+          for (auto *alias : curAliIN[casted])
+          {
+            curAliOUT[bitcastInst].insert(alias);
+            curAliOUT[alias].insert(bitcastInst);
+          }
+          switch (checkType(bitcastInst))
+          {
+          case CAT_DATA:
+            curOUT[bitcastInst].clear();
+            curOUT[bitcastInst].insert(curIN[casted].begin(), curIN[casted].end());
+            break;
+          case CAT_PTR:
+            curPtOUT[bitcastInst].clear();
+            curPtOUT[bitcastInst].insert(curPtIN[casted].begin(), curPtIN[casted].end());
+            break;
+          case OTHER:
+            break;
+          }
+        }
         // CAT OP: changes RDA of the first operand
         else if (auto *callInst = dyn_cast<CallInst>(&I))
         {
@@ -576,7 +670,27 @@ namespace
           // MISC FUNC
           else if (!calledName.equals("CAT_destroy") && !calledName.equals("printf") && !calledName.startswith("llvm.lifetime"))
           {
-            std::set<Value *> possibleDataPassedIn, possiblePtrPassedIn;
+            std::set<Value *> possibleDataPassedIn, possiblePtrPassedIn, possiblePtrModified;
+
+            // add globals
+            for (auto &GV : curModule->globals())
+              switch (checkType(&GV))
+              {
+              case CAT_DATA:
+                possibleDataPassedIn.insert(&GV);
+                break;
+              case OTHER:
+                break;
+              case CAT_PTR:
+                possiblePtrPassedIn.insert(&GV);
+                if (mayReferencedByFunc(callInst, &GV))
+                {
+                  auto possibleCATData = findAllPossibleCATData(&GV, curPtIN);
+                  possibleDataPassedIn.insert(possibleCATData.begin(), possibleCATData.end());
+                }
+                break;
+              }
+
             for (unsigned i = 0; i < callInst->getNumOperands() - 1; i++)
             {
               auto *arg = callInst->getArgOperand(i);
@@ -589,47 +703,54 @@ namespace
                 break;
               case CAT_PTR:
                 possiblePtrPassedIn.insert(arg);
-                auto possibleCATData = findAllPossibleCATData(arg, curPtIN);
-                possibleDataPassedIn.insert(possibleCATData.begin(), possibleCATData.end());
+                if (mayReferencedByFunc(callInst, arg))
+                {
+                  auto possibleCATData = findAllPossibleCATData(arg, curPtIN);
+                  possibleDataPassedIn.insert(possibleCATData.begin(), possibleCATData.end());
+                }
                 break;
               }
             }
 
             for (auto *ptr : possiblePtrPassedIn)
               if (mayModifiedByFunc(callInst, ptr))
-                // merge all the possible CAT_data refs
-                for (auto *data : possibleDataPassedIn)
-                  addPointTo(ptr, data, curAliIN, curPtOUT);
+                possiblePtrModified.insert(ptr);
 
             for (auto *data : possibleDataPassedIn)
-              if (mayModifiedByFunc(callInst, data))
-                setDef(data, UNKNOWN, curAliIN, curOUT, curCacheOUT);
+              if (data == UNKNOWN)
+                continue;
+              else if (mayModifiedByFunc(callInst, data))
+                setDef(data, callInst, curAliIN, curOUT, curCacheOUT);
 
-            // dynamic type collection
-            if (auto *ptrType = dyn_cast<PointerType>(callInst->getType()))
-            {
-              if (ptrType->getPointerElementType()->isIntegerTy(8))
-                // if the return type is char*, then it's a string
-                allCATData.insert(callInst);
-              else
-                // otherwise it's a pointer
-                allCATPtr.insert(callInst);
-            }
+            // modified PTR can point to any passed in DATA
+            for (auto *ptr : possiblePtrModified)
+              for (auto *data : possibleDataPassedIn)
+                addPointTo(ptr, data, curAliIN, curPtOUT);
 
+            // the return value can be alias of any same-level argument
             switch (checkType(callInst))
             {
             case CAT_DATA:
               // merge all info of possible CAT_data
               resetAliasInfo(callInst, curAliIN, curAliOUT);
               curOUT[callInst].clear();
+
+              // it could be pointed by any possible CAT_ptr modified
+              for (auto *ptr : possiblePtrModified)
+                curPtOUT[ptr].insert(callInst);
+
               for (auto *data : possibleDataPassedIn)
+              {
                 if (data == UNKNOWN)
                   curOUT[callInst].insert(UNKNOWN);
+                else if (AA->alias(data, getSize(data), callInst, getSize(callInst)) == AliasResult::NoAlias)
+                  continue;
                 else
                 {
                   curOUT[callInst].insert(curOUT[data].begin(), curOUT[data].end());
                   mergeAliasInfo(data, callInst, curAliIN, curAliOUT);
                 }
+              }
               break;
             case CAT_PTR:
               // merge all info of possible CAT_ptr
@@ -637,6 +758,8 @@ namespace
               curPtOUT[callInst].clear();
               for (auto *ptr : possiblePtrPassedIn)
               {
+                if (AA->alias(ptr, getSize(ptr), callInst, getSize(callInst)) == AliasResult::NoAlias)
+                  continue;
                 curPtOUT[callInst].insert(curPtOUT[ptr].begin(), curPtOUT[ptr].end());
                 mergeAliasInfo(ptr, callInst, curAliIN, curAliOUT);
               }
@@ -683,67 +806,58 @@ namespace
     void dumpRDAInfo()
     {
       cout << "Function \"" << curFunc->getName() << "\"\n";
-      for (auto &pair : IN)
-      {
-        cout << "INSTRUCTION: " << *pair.first << "\n***************** RDA IN\n{\n";
 
-        for (auto &defPair : pair.second)
+      for (auto &BB : *curFunc)
+        for (auto &I : BB)
         {
-          cout << "DEF OF " << *defPair.first << ":\n";
-          for (auto *I : defPair.second)
-            if (I)
-              cout << "  " << *I << "\n";
-            else
-              cout << "  UNKNOWN\n";
+          cout << "INSTRUCTION: " << I << "\n***************** RDA IN\n{\n";
+          for (auto &pair : IN[&I])
+          {
+            cout << "DEF OF " << *pair.first << ":\n";
+            for (auto *def : pair.second)
+              if (def)
+                cout << "  " << *def << "\n";
+              else
+                cout << "  UNKNOWN\n";
+          }
+          cout << "}\n**************************************\n";
+
+          cout << "***************** POINT-TO IN\n{\n";
+          for (auto &pair : ptIN[&I])
+          {
+            cout << "DEF OF " << *pair.first << ":\n";
+            for (auto *def : pair.second)
+              if (def)
+                cout << "  " << *def << "\n";
+              else
+                cout << "  UNKNOWN\n";
+          }
+          cout << "}\n**************************************\n";
+
+          cout << "***************** RDA OUT\n{\n";
+          for (auto &pair : OUT[&I])
+          {
+            cout << "DEF OF " << *pair.first << ":\n";
+            for (auto *def : pair.second)
+              if (def)
+                cout << "  " << *def << "\n";
+              else
+                cout << "  UNKNOWN\n";
+          }
+          cout << "}\n**************************************\n";
+
+          cout << "***************** POINT-TO OUT\n{\n";
+          for (auto &pair : ptOUT[&I])
+          {
+            cout << "DEF OF " << *pair.first << ":\n";
+            for (auto *def : pair.second)
+              if (def)
+                cout << "  " << *def << "\n";
+              else
+                cout << "  UNKNOWN\n";
+          }
+          cout << "}\n**************************************\n";
         }
-
-        cout << "}\n**************************************\n***************** RDA OUT\n{\n";
-
-        for (auto &defPair : OUT[pair.first])
-        {
-          cout << "DEF OF " << *defPair.first << ":\n";
-          for (auto *I : defPair.second)
-            if (I)
-              cout << "  " << *I << "\n";
-            else
-              cout << "  UNKNOWN\n";
-        }
-
-        errs() << "}\n**************************************\n";
-      }
-    }
-
-    void dumpPointToInfo()
-    {
-      cout << "Function \"" << curFunc->getName() << "\"\n";
-      for (auto &pair : ptIN)
-      {
-        cout << "INSTRUCTION: " << *pair.first << "\n***************** POINT-TO IN\n{\n";
-
-        for (auto &defPair : pair.second)
-        {
-          cout << "DEF OF " << *defPair.first << ":\n";
-          for (auto *I : defPair.second)
-            if (I)
-              cout << "  " << *I << "\n";
-            else
-              cout << "  UNKNOWN\n";
-        }
-
-        cout << "}\n**************************************\n***************** POINT-TO OUT\n{\n";
-
-        for (auto &defPair : ptOUT[pair.first])
-        {
-          cout << "DEF OF " << *defPair.first << ":\n";
-          for (auto *I : defPair.second)
-            if (I)
-              cout << "  " << *I << "\n";
-            else
-              cout << "  UNKNOWN\n";
-        }
-
-        errs() << "}\n**************************************\n";
-      }
     }
 
     void dumpTypeInfo()
@@ -931,10 +1045,8 @@ namespace
 
       collectTypeInfo();
       RDA();
-
       // dumpTypeInfo();
       // dumpRDAInfo();
-      // dumpPointToInfo();
 
       bool changed = false;
 
