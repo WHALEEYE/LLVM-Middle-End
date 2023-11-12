@@ -27,6 +27,8 @@ namespace
   typedef std::map<Value *, Value *> CacheSet;
   typedef std::map<Instruction *, CacheSet> CacheMap;
 
+  std::unordered_set<std::string> ignored_funcs = {"printf", "puts", "CAT_destroy"};
+
   struct CAT : public FunctionPass
   {
     static char ID;
@@ -668,7 +670,7 @@ namespace
             //   curCacheOUT[data] = callInst;
           }
           // MISC FUNC
-          else if (!calledName.equals("CAT_destroy") && !calledName.equals("printf") && !calledName.startswith("llvm.lifetime"))
+          else if (ignored_funcs.find(calledName.str()) == ignored_funcs.end() && !calledName.startswith("llvm.lifetime"))
           {
             std::set<Value *> possibleDataPassedIn, possiblePtrPassedIn, possiblePtrModified;
 
@@ -720,7 +722,7 @@ namespace
               if (data == UNKNOWN)
                 continue;
               else if (mayModifiedByFunc(callInst, data))
-                setDef(data, callInst, curAliIN, curOUT, curCacheOUT);
+                setDef(data, UNKNOWN, curAliIN, curOUT, curCacheOUT);
 
             // modified PTR can point to any passed in DATA
             for (auto *ptr : possiblePtrModified)
