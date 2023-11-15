@@ -6,6 +6,10 @@
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/Analysis/CallGraph.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <map>
 #include <set>
 #include <unordered_set>
@@ -29,11 +33,11 @@ namespace
 
   std::unordered_set<std::string> ignored_funcs = {"printf", "puts", "CAT_destroy"};
 
-  struct CAT : public FunctionPass
+  struct CAT : public ModulePass
   {
     static char ID;
 
-    CAT() : FunctionPass(ID) {}
+    CAT() : ModulePass(ID) {}
 
     enum VType
     {
@@ -48,6 +52,7 @@ namespace
     EscapeMap escIN, escOUT;
     CacheMap cacheIN, cacheOUT;
     std::set<Value *> allCATData, allCATPtr;
+    CallGraph *CG;
 
     Function *curFunc;
     Module *curModule;
@@ -1039,11 +1044,11 @@ namespace
 
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
-    bool runOnFunction(Function &F) override
+    bool runOnFunction(Function &F)
     {
       resetGlobalMaps();
       curFunc = &F;
-      AA = &getAnalysis<AAResultsWrapperPass>().getAAResults();
+      AA = &getAnalysis<AAResultsWrapperPass>(F).getAAResults();
 
       collectTypeInfo();
       RDA();
@@ -1058,9 +1063,38 @@ namespace
       return changed;
     }
 
+    bool runOnModule(Module &M) override
+    {
+
+      this->CG = &(getAnalysis<CallGraphWrapperPass>().getCallGraph());
+      bool modified = false;
+
+      for (auto &F : M)
+      {
+        if (!F.isDeclaration())
+        {
+          if (F.hasFnAttribute(llvm::Attribute::NoInline))
+          {
+            F.removeFnAttr(llvm::Attribute::NoInline);
+          }
+          F.addFnAttr(llvm::Attribute::AlwaysInline);
+
+          modified = true;
+        }
+      }
+
+      for (auto &F : M) {
+        if(F.isDeclaration()) continue;
+        modified |= runOnFunction(F);
+      }
+
+      return modified;
+    }
     // The LLVM IR of functions isn't ready at this point
     void getAnalysisUsage(AnalysisUsage &AU) const override
     {
+      
+      AU.addRequired<CallGraphWrapperPass>();
       AU.addRequired<AAResultsWrapperPass>();
       // nothing is preserved, so we don't need to do anything here
     }
