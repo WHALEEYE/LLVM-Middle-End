@@ -3,6 +3,16 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
+#include "llvm/Transforms/Utils/UnrollLoop.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/Transforms/Utils/LoopPeel.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
@@ -31,7 +41,7 @@ namespace
   typedef std::map<Value *, Value *> CacheSet;
   typedef std::map<Instruction *, CacheSet> CacheMap;
 
-  std::unordered_set<std::string> ignored_funcs = {"printf", "puts", "CAT_destroy"};
+  std::unordered_set<std::string> ignored_funcs = {"printf", "puts", "CAT_destroy", "CAT_get"};
 
   struct CAT : public ModulePass
   {
@@ -666,14 +676,6 @@ namespace
             Value *gen = callInst->getArgOperand(0);
             setDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
           }
-          // CAT_get: affects the CACHE of get
-          else if (calledName.equals("CAT_get"))
-          {
-            // auto *data = callInst->getArgOperand(0);
-            // // keep the earliest CAT_get as cache
-            // if (curCacheOUT[data] == NO_CACHE)
-            //   curCacheOUT[data] = callInst;
-          }
           // MISC FUNC
           else if (ignored_funcs.find(calledName.str()) == ignored_funcs.end() && !calledName.startswith("llvm.lifetime"))
           {
@@ -993,25 +995,11 @@ namespace
           continue;
 
         auto *constant = getIfIsConstant(callInst->getOperand(0), IN[I]);
-
-        // first check if the data is constant
-        // if it is then we don't need to check the cache
-        if (constant)
-        {
-          callInst->replaceAllUsesWith(constant);
-          deleteList.push_back(callInst);
+        if (!constant)
           continue;
-        }
 
-        // if the data is already got and not modified, reuse
-        // only when the data is not constant, we try reuse it
-        // because only under this condition we can make sure the cache is not deleted
-        // auto *cache = cacheIN[I][callInst->getOperand(0)];
-        // if (cache == NO_CACHE)
-        //   continue;
-
-        // callInst->replaceAllUsesWith(cache);
-        // deleteList.push_back(callInst);
+        callInst->replaceAllUsesWith(constant);
+        deleteList.push_back(callInst);
       }
 
       for (auto I : deleteList)
@@ -1042,23 +1030,82 @@ namespace
       }
     }
 
+    bool transformLoops()
+    {
+      bool changed = false;
+      auto &LI = getAnalysis<LoopInfoWrapperPass>(*curFunc).getLoopInfo();
+      auto &DT = getAnalysis<DominatorTreeWrapperPass>(*curFunc).getDomTree();
+      auto &SE = getAnalysis<ScalarEvolutionWrapperPass>(*curFunc).getSE();
+      auto &AC = getAnalysis<AssumptionCacheTracker>().getAssumptionCache(*curFunc);
+      const auto &TTI = getAnalysis<TargetTransformInfoWrapperPass>().getTTI(*curFunc);
+      OptimizationRemarkEmitter ORE(curFunc);
+
+      for (auto *L : LI)
+      {
+        auto loop = &*L;
+        changed |= walkLoop(LI, loop, DT, SE, AC, ORE, TTI);
+      }
+      return changed;
+    }
+
+    bool walkLoop(
+        LoopInfo &LI,
+        Loop *loop,
+        DominatorTree &DT,
+        ScalarEvolution &SE,
+        AssumptionCache &AC,
+        OptimizationRemarkEmitter &ORE,
+        const TargetTransformInfo &TTI)
+    {
+      if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
+      {
+        auto tripCount = SE.getSmallConstantTripCount(loop);
+        if (tripCount > 0)
+        {
+          UnrollLoopOptions ULO;
+          ULO.Count = 2;
+          ULO.Force = false;
+          ULO.Runtime = false;
+          ULO.AllowExpensiveTripCount = true;
+          ULO.UnrollRemainder = false;
+          ULO.ForgetAllSCEV = true;
+          auto unrolled = UnrollLoop(loop, ULO, &LI, &SE, &DT, &AC, &TTI, &ORE, true);
+          if (unrolled != LoopUnrollResult::Unmodified)
+            return true;
+        }
+      }
+
+      auto subLoops = loop->getSubLoops();
+      for (auto j : subLoops)
+      {
+        auto subloop = &*j;
+        if (walkLoop(LI, subloop, DT, SE, AC, ORE, TTI))
+          return true;
+      }
+
+      return false;
+    }
+
     // This function is invoked once per function compiled
     // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
     bool runOnFunction(Function &F)
     {
+      bool changed = false;
+      bool unrolled = false;
       resetGlobalMaps();
       curFunc = &F;
-      AA = &getAnalysis<AAResultsWrapperPass>(F).getAAResults();
 
+      AA = &getAnalysis<AAResultsWrapperPass>(F).getAAResults();
       collectTypeInfo();
       RDA();
       // dumpTypeInfo();
       // dumpRDAInfo();
 
-      bool changed = false;
-
       changed |= constantFoldAndAlgSimp();
       changed |= constantProp();
+
+      if (!changed)
+        changed |= transformLoops();
 
       return changed;
     }
@@ -1070,21 +1117,18 @@ namespace
       bool modified = false;
 
       for (auto &F : M)
-      {
         if (!F.isDeclaration())
         {
           if (F.hasFnAttribute(llvm::Attribute::NoInline))
-          {
             F.removeFnAttr(llvm::Attribute::NoInline);
-          }
           F.addFnAttr(llvm::Attribute::AlwaysInline);
-
           modified = true;
         }
-      }
 
-      for (auto &F : M) {
-        if(F.isDeclaration()) continue;
+      for (auto &F : M)
+      {
+        if (F.isDeclaration())
+          continue;
         modified |= runOnFunction(F);
       }
 
@@ -1093,9 +1137,14 @@ namespace
     // The LLVM IR of functions isn't ready at this point
     void getAnalysisUsage(AnalysisUsage &AU) const override
     {
-      
+
       AU.addRequired<CallGraphWrapperPass>();
       AU.addRequired<AAResultsWrapperPass>();
+      AU.addRequired<AssumptionCacheTracker>();
+      AU.addRequired<DominatorTreeWrapperPass>();
+      AU.addRequired<LoopInfoWrapperPass>();
+      AU.addRequired<ScalarEvolutionWrapperPass>();
+      AU.addRequired<TargetTransformInfoWrapperPass>();
       // nothing is preserved, so we don't need to do anything here
     }
   };
