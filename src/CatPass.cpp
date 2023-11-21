@@ -62,6 +62,7 @@ namespace
     EscapeMap escIN, escOUT;
     CacheMap cacheIN, cacheOUT;
     std::set<Value *> allCATData, allCATPtr;
+    std::map<Instruction *, Instruction *> deleteMap;
     CallGraph *CG;
 
     Function *curFunc;
@@ -91,6 +92,7 @@ namespace
       cacheOUT.clear();
       allCATData.clear();
       allCATPtr.clear();
+      deleteMap.clear();
     }
 
     int getSize(Value *ptr)
@@ -890,6 +892,9 @@ namespace
         if (def == UNKNOWN)
           return nullptr;
 
+        if (deleteMap.find(def) != deleteMap.end())
+          def = deleteMap[def];
+
         Value *candidate = nullptr;
         if (auto *callInst = dyn_cast<CallInst>(def))
         {
@@ -917,6 +922,9 @@ namespace
 
     bool constantFoldAndAlgSimp()
     {
+      if (!curModule->getFunction("CAT_set"))
+        return false;
+
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
       for (auto &B : curFunc->getBasicBlockList())
@@ -945,7 +953,7 @@ namespace
         if (calledName.equals("CAT_sub") && op1 == op2)
         {
           newOperand = ConstantInt::get(Type::getInt64Ty(curFunc->getContext()), 0);
-          builder.CreateCall(curModule->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), newOperand}));
+          deleteMap[callInst] = builder.CreateCall(curModule->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), newOperand}));
           deleteList.push_back(callInst);
           continue;
         }
@@ -967,7 +975,7 @@ namespace
         else
           continue;
 
-        builder.CreateCall(curModule->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), newOperand}));
+        deleteMap[callInst] = builder.CreateCall(curModule->getFunction("CAT_set"), std::vector<Value *>({callInst->getOperand(0), newOperand}));
         deleteList.push_back(callInst);
       }
       for (auto *I : deleteList)
@@ -1057,13 +1065,14 @@ namespace
         OptimizationRemarkEmitter &ORE,
         const TargetTransformInfo &TTI)
     {
+      cout << loop << "\n";
       if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
       {
         auto tripCount = SE.getSmallConstantTripCount(loop);
         if (tripCount > 0)
         {
           UnrollLoopOptions ULO;
-          ULO.Count = 2;
+          ULO.Count = tripCount;
           ULO.Force = false;
           ULO.Runtime = false;
           ULO.AllowExpensiveTripCount = true;
@@ -1104,8 +1113,7 @@ namespace
       changed |= constantFoldAndAlgSimp();
       changed |= constantProp();
 
-      if (!changed)
-        changed |= transformLoops();
+      changed |= transformLoops();
 
       return changed;
     }
