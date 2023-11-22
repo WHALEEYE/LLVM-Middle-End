@@ -1038,6 +1038,19 @@ namespace
       }
     }
 
+    std::set<Loop *> findInnestLoops(Loop *loop)
+    {
+      if (loop->getSubLoops().empty())
+        return std::set<Loop *>({loop});
+      else
+      {
+        std::set<Loop *> innestLoops;
+        for (auto *subloop : loop->getSubLoops())
+          innestLoops.insert(findInnestLoops(subloop).begin(), findInnestLoops(subloop).end());
+        return innestLoops;
+      }
+    }
+
     bool transformLoops()
     {
       bool changed = false;
@@ -1048,11 +1061,22 @@ namespace
       const auto &TTI = getAnalysis<TargetTransformInfoWrapperPass>().getTTI(*curFunc);
       OptimizationRemarkEmitter ORE(curFunc);
 
-      for (auto *L : LI)
+      std::set<Loop *> innestLoops;
+
+      for (auto L : LI)
       {
         auto loop = &*L;
-        changed |= walkLoop(LI, loop, DT, SE, AC, ORE, TTI);
+        auto innerLoops = loop->getSubLoops();
+        innestLoops.insert(innerLoops.begin(), innerLoops.end());
       }
+
+      for (auto loop : innestLoops)
+        changed |= loopPeel(LI, loop, DT, SE, AC, ORE, TTI);
+
+      // // if (!changed)
+      // for (auto loop : loops)
+      //   loopPeel(LI, loop, DT, SE, AC, ORE, TTI);
+
       return changed;
     }
 
@@ -1065,10 +1089,14 @@ namespace
         OptimizationRemarkEmitter &ORE,
         const TargetTransformInfo &TTI)
     {
-      cout << loop << "\n";
+      // if (walked.find(loop) != walked.end())
+      //   return false;
+      // walked.insert(loop);
+      cout << "Walk Loop: " << loop << "\n";
       if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
       {
         auto tripCount = SE.getSmallConstantTripCount(loop);
+        cout << "Trip Count: " << tripCount << "\n";
         if (tripCount > 0)
         {
           UnrollLoopOptions ULO;
@@ -1084,14 +1112,38 @@ namespace
         }
       }
 
-      auto subLoops = loop->getSubLoops();
-      for (auto j : subLoops)
-      {
-        auto subloop = &*j;
-        if (walkLoop(LI, subloop, DT, SE, AC, ORE, TTI))
-          return true;
-      }
+      // auto subLoops = loop->getSubLoops();
+      // for (auto j : subLoops)
+      // {
+      //   auto subloop = &*j;
+      //   if (walkLoop(LI, subloop, DT, SE, AC, ORE, TTI))
+      //     return true;
+      // }
 
+      return false;
+    }
+
+    bool loopPeel(
+        LoopInfo &LI,
+        Loop *loop,
+        DominatorTree &DT,
+        ScalarEvolution &SE,
+        AssumptionCache &AC,
+        OptimizationRemarkEmitter &ORE,
+        const TargetTransformInfo &TTI)
+    {
+      cout << "Peel Loop: " << loop << "\n";
+      if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
+      {
+        auto tripCount = SE.getSmallConstantTripCount(loop);
+        if (tripCount > 2)
+        {
+          if (peelLoop(loop, tripCount - 2, &LI, &SE, DT, &AC, true))
+          {
+            return true;
+          }
+        }
+      }
       return false;
     }
 
@@ -1100,9 +1152,11 @@ namespace
     bool runOnFunction(Function &F)
     {
       bool changed = false;
-      bool unrolled = false;
       resetGlobalMaps();
       curFunc = &F;
+
+      if (transformLoops())
+        return true;
 
       AA = &getAnalysis<AAResultsWrapperPass>(F).getAAResults();
       collectTypeInfo();
@@ -1112,8 +1166,6 @@ namespace
 
       changed |= constantFoldAndAlgSimp();
       changed |= constantProp();
-
-      changed |= transformLoops();
 
       return changed;
     }
@@ -1145,7 +1197,6 @@ namespace
     // The LLVM IR of functions isn't ready at this point
     void getAnalysisUsage(AnalysisUsage &AU) const override
     {
-
       AU.addRequired<CallGraphWrapperPass>();
       AU.addRequired<AAResultsWrapperPass>();
       AU.addRequired<AssumptionCacheTracker>();
