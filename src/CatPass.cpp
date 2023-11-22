@@ -1061,26 +1061,29 @@ namespace
       const auto &TTI = getAnalysis<TargetTransformInfoWrapperPass>().getTTI(*curFunc);
       OptimizationRemarkEmitter ORE(curFunc);
 
-      std::set<Loop *> innestLoops;
+      std::set<Loop *> loops;
 
       for (auto L : LI)
-      {
-        auto loop = &*L;
-        auto innerLoops = loop->getSubLoops();
-        innestLoops.insert(innerLoops.begin(), innerLoops.end());
-      }
+        loops.insert(L);
 
-      for (auto loop : innestLoops)
-        changed |= loopPeel(LI, loop, DT, SE, AC, ORE, TTI);
+      // for (auto loop : loops)
+      //   changed |= loopUnroll(LI, loop, DT, SE, AC, ORE, TTI);
 
       // // if (!changed)
-      // for (auto loop : loops)
-      //   loopPeel(LI, loop, DT, SE, AC, ORE, TTI);
+      // // {
+      int count = 0;
+      for (auto loop : loops)
+      {
+        changed |= loopPeel(LI, loop, DT, SE, AC);
+        if (++count >= 10)
+          break;
+      }
+      // // }
 
       return changed;
     }
 
-    bool walkLoop(
+    bool loopUnroll(
         LoopInfo &LI,
         Loop *loop,
         DominatorTree &DT,
@@ -1089,36 +1092,26 @@ namespace
         OptimizationRemarkEmitter &ORE,
         const TargetTransformInfo &TTI)
     {
-      // if (walked.find(loop) != walked.end())
-      //   return false;
-      // walked.insert(loop);
-      cout << "Walk Loop: " << loop << "\n";
       if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
       {
         auto tripCount = SE.getSmallConstantTripCount(loop);
-        cout << "Trip Count: " << tripCount << "\n";
-        if (tripCount > 0)
-        {
-          UnrollLoopOptions ULO;
-          ULO.Count = tripCount;
-          ULO.Force = false;
-          ULO.Runtime = false;
-          ULO.AllowExpensiveTripCount = true;
-          ULO.UnrollRemainder = false;
-          ULO.ForgetAllSCEV = true;
-          auto unrolled = UnrollLoop(loop, ULO, &LI, &SE, &DT, &AC, &TTI, &ORE, true);
-          if (unrolled != LoopUnrollResult::Unmodified)
-            return true;
-        }
+
+        UnrollLoopOptions ULO;
+        ULO.Count = 2;
+        ULO.Force = false;
+        ULO.Runtime = true;
+        ULO.AllowExpensiveTripCount = true;
+        ULO.UnrollRemainder = false;
+        ULO.ForgetAllSCEV = true;
+        auto unrolled = UnrollLoop(loop, ULO, &LI, &SE, &DT, &AC, &TTI, &ORE, true);
+        if (unrolled != LoopUnrollResult::Unmodified)
+          return true;
       }
 
-      // auto subLoops = loop->getSubLoops();
-      // for (auto j : subLoops)
-      // {
-      //   auto subloop = &*j;
-      //   if (walkLoop(LI, subloop, DT, SE, AC, ORE, TTI))
-      //     return true;
-      // }
+      auto subLoops = loop->getSubLoops();
+      for (auto j : subLoops)
+        if (loopUnroll(LI, j, DT, SE, AC, ORE, TTI))
+          return true;
 
       return false;
     }
@@ -1128,21 +1121,14 @@ namespace
         Loop *loop,
         DominatorTree &DT,
         ScalarEvolution &SE,
-        AssumptionCache &AC,
-        OptimizationRemarkEmitter &ORE,
-        const TargetTransformInfo &TTI)
+        AssumptionCache &AC)
     {
-      cout << "Peel Loop: " << loop << "\n";
-      if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
+      if (canPeel(loop) && loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
       {
         auto tripCount = SE.getSmallConstantTripCount(loop);
         if (tripCount > 2)
-        {
           if (peelLoop(loop, tripCount - 2, &LI, &SE, DT, &AC, true))
-          {
             return true;
-          }
-        }
       }
       return false;
     }
