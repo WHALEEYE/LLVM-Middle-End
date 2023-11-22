@@ -41,7 +41,8 @@ namespace
   typedef std::map<Value *, Value *> CacheSet;
   typedef std::map<Instruction *, CacheSet> CacheMap;
 
-  std::unordered_set<std::string> ignored_funcs = {"printf", "puts", "CAT_destroy", "CAT_get"};
+  const std::unordered_set<std::string> ignoredFuncs = {"printf", "puts", "CAT_destroy", "CAT_get"};
+  const std::unordered_set<std::string> catApis = {"CAT_new", "CAT_add", "CAT_sub", "CAT_set", "CAT_get", "CAT_destroy"};
 
   struct CAT : public ModulePass
   {
@@ -63,6 +64,7 @@ namespace
     CacheMap cacheIN, cacheOUT;
     std::set<Value *> allCATData, allCATPtr;
     std::map<Instruction *, Instruction *> deleteMap;
+    std::map<Value *, Value *> propMap;
     CallGraph *CG;
 
     Function *curFunc;
@@ -93,6 +95,7 @@ namespace
       allCATData.clear();
       allCATPtr.clear();
       deleteMap.clear();
+      propMap.clear();
     }
 
     int getSize(Value *ptr)
@@ -679,7 +682,7 @@ namespace
             setDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
           }
           // MISC FUNC
-          else if (ignored_funcs.find(calledName.str()) == ignored_funcs.end() && !calledName.startswith("llvm.lifetime"))
+          else if (ignoredFuncs.find(calledName.str()) == ignoredFuncs.end() && !calledName.startswith("llvm.lifetime"))
           {
             std::set<Value *> possibleDataPassedIn, possiblePtrPassedIn, possiblePtrModified;
 
@@ -908,6 +911,9 @@ namespace
             candidate = nullptr;
         }
 
+        if (propMap.find(candidate) != propMap.end())
+          candidate = propMap[candidate];
+
         if (!candidate || !isa<ConstantInt>(candidate))
           return nullptr;
 
@@ -1008,6 +1014,7 @@ namespace
 
         callInst->replaceAllUsesWith(constant);
         deleteList.push_back(callInst);
+        propMap[callInst] = constant;
       }
 
       for (auto I : deleteList)
@@ -1051,9 +1058,13 @@ namespace
       }
     }
 
+    // use unroll and peel to optimize loops
     bool transformLoops()
     {
       bool changed = false;
+      // only unroll loops in function with less than 800 instructions
+      if (curFunc->getInstructionCount() > 800)
+        return false;
       auto &LI = getAnalysis<LoopInfoWrapperPass>(*curFunc).getLoopInfo();
       auto &DT = getAnalysis<DominatorTreeWrapperPass>(*curFunc).getDomTree();
       auto &SE = getAnalysis<ScalarEvolutionWrapperPass>(*curFunc).getSE();
@@ -1062,25 +1073,48 @@ namespace
       OptimizationRemarkEmitter ORE(curFunc);
 
       std::set<Loop *> loops;
-
+      // create a set of loops that contain CAT APIs
       for (auto L : LI)
-        loops.insert(L);
-
-      // for (auto loop : loops)
-      //   changed |= loopUnroll(LI, loop, DT, SE, AC, ORE, TTI);
-
-      // // if (!changed)
-      // // {
-      int count = 0;
-      for (auto loop : loops)
       {
-        changed |= loopPeel(LI, loop, DT, SE, AC);
-        if (++count >= 10)
-          break;
+        if (!containsCATApi(L))
+          continue;
+        loops.insert(L);
       }
-      // // }
+
+      // try to unroll
+      for (auto loop : loops)
+        changed |= loopUnroll(LI, loop, DT, SE, AC, ORE, TTI);
+
+      // if there are loops unrolled, don't peel
+      // let constant optimization do some work first
+      if (changed)
+        return true;
+
+      for (auto loop : loops)
+        changed |= loopPeel(LI, loop, DT, SE, AC);
 
       return changed;
+    }
+
+    bool containsCATApi(Loop *loop)
+    {
+      for (auto *BB : loop->getBlocks())
+        for (auto &I : *BB)
+          if (auto callInst = dyn_cast<CallInst>(&I))
+          {
+            auto calledName = callInst->getCalledFunction()->getName();
+            if (catApis.find(calledName.str()) != catApis.end())
+              return true;
+          }
+      return false;
+    }
+
+    int countLoopInstructions(Loop *loop)
+    {
+      int count = 0;
+      for (auto *BB : loop->getBlocks())
+        count += BB->size();
+      return count;
     }
 
     bool loopUnroll(
@@ -1092,14 +1126,14 @@ namespace
         OptimizationRemarkEmitter &ORE,
         const TargetTransformInfo &TTI)
     {
+      if (countLoopInstructions(loop) > 300)
+        return false;
       if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
       {
-        auto tripCount = SE.getSmallConstantTripCount(loop);
-
         UnrollLoopOptions ULO;
-        ULO.Count = 2;
+        ULO.Count = 4;
         ULO.Force = false;
-        ULO.Runtime = true;
+        ULO.Runtime = false;
         ULO.AllowExpensiveTripCount = true;
         ULO.UnrollRemainder = false;
         ULO.ForgetAllSCEV = true;
@@ -1123,13 +1157,9 @@ namespace
         ScalarEvolution &SE,
         AssumptionCache &AC)
     {
-      if (canPeel(loop) && loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
-      {
-        auto tripCount = SE.getSmallConstantTripCount(loop);
-        if (tripCount > 2)
-          if (peelLoop(loop, tripCount - 2, &LI, &SE, DT, &AC, true))
-            return true;
-      }
+      if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
+        if (peelLoop(loop, 2, &LI, &SE, DT, &AC, true))
+          return true;
       return false;
     }
 
@@ -1141,9 +1171,6 @@ namespace
       resetGlobalMaps();
       curFunc = &F;
 
-      if (transformLoops())
-        return true;
-
       AA = &getAnalysis<AAResultsWrapperPass>(F).getAAResults();
       collectTypeInfo();
       RDA();
@@ -1152,6 +1179,9 @@ namespace
 
       changed |= constantFoldAndAlgSimp();
       changed |= constantProp();
+
+      if (!changed)
+        changed |= transformLoops();
 
       return changed;
     }
@@ -1174,6 +1204,8 @@ namespace
       for (auto &F : M)
       {
         if (F.isDeclaration())
+          continue;
+        else if ((F.getNumUses() == 0) && (&F != curModule->getFunction("main")))
           continue;
         modified |= runOnFunction(F);
       }
