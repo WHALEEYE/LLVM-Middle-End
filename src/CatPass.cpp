@@ -1045,25 +1045,12 @@ namespace
       }
     }
 
-    std::set<Loop *> findInnestLoops(Loop *loop)
-    {
-      if (loop->getSubLoops().empty())
-        return std::set<Loop *>({loop});
-      else
-      {
-        std::set<Loop *> innestLoops;
-        for (auto *subloop : loop->getSubLoops())
-          innestLoops.insert(findInnestLoops(subloop).begin(), findInnestLoops(subloop).end());
-        return innestLoops;
-      }
-    }
-
     // use unroll and peel to optimize loops
     bool transformLoops()
     {
       bool changed = false;
-      // only unroll loops in function with less than 800 instructions
-      if (curFunc->getInstructionCount() > 800)
+      // only handle loops in function with less than 800 instructions
+      if (curFunc->getInstructionCount() >= 800)
         return false;
       auto &LI = getAnalysis<LoopInfoWrapperPass>(*curFunc).getLoopInfo();
       auto &DT = getAnalysis<DominatorTreeWrapperPass>(*curFunc).getDomTree();
@@ -1081,17 +1068,12 @@ namespace
         loops.insert(L);
       }
 
-      // try to unroll
-      for (auto loop : loops)
-        changed |= loopUnroll(LI, loop, DT, SE, AC, ORE, TTI);
-
-      // if there are loops unrolled, don't peel
-      // let constant optimization do some work first
-      if (changed)
-        return true;
-
-      for (auto loop : loops)
-        changed |= loopPeel(LI, loop, DT, SE, AC);
+      if (!peeled())
+        for (auto loop : loops)
+          changed |= loopPeel(LI, loop, DT, SE, AC);
+      else
+        for (auto loop : loops)
+          changed |= loopUnroll(LI, loop, DT, SE, AC, ORE, TTI);
 
       return changed;
     }
@@ -1106,6 +1088,14 @@ namespace
             if (catApis.find(calledName.str()) != catApis.end())
               return true;
           }
+      return false;
+    }
+
+    bool peeled()
+    {
+      for (auto &BB : *curFunc)
+        if (BB.getName().contains("peel"))
+          return true;
       return false;
     }
 
@@ -1126,8 +1116,6 @@ namespace
         OptimizationRemarkEmitter &ORE,
         const TargetTransformInfo &TTI)
     {
-      if (countLoopInstructions(loop) > 300)
-        return false;
       if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
       {
         UnrollLoopOptions ULO;
@@ -1158,7 +1146,7 @@ namespace
         AssumptionCache &AC)
     {
       if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
-        if (peelLoop(loop, 2, &LI, &SE, DT, &AC, true))
+        if (peelLoop(loop, 10, &LI, &SE, DT, &AC, true))
           return true;
       return false;
     }
