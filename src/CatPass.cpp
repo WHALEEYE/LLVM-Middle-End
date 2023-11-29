@@ -948,22 +948,25 @@ namespace
         return false;
 
       std::vector<CallInst *> deleteList;
-      std::vector<Instruction *> instructions;
+      std::vector<CallInst *> instructions;
       for (auto &B : curFunc->getBasicBlockList())
         for (auto &I : B)
-          instructions.push_back(&I);
+        {
 
-      for (auto *I : instructions)
+          if (!isa<CallInst>(I))
+            continue;
+
+          auto *callInst = cast<CallInst>(&I);
+          auto calledName = callInst->getCalledFunction()->getName();
+
+          if (!(calledName.equals("CAT_add") || calledName.equals("CAT_sub")))
+            continue;
+          instructions.push_back(callInst);
+        }
+
+      for (auto *callInst : instructions)
       {
-        if (!isa<CallInst>(I))
-          continue;
-
-        auto *callInst = cast<CallInst>(I);
         auto calledName = callInst->getCalledFunction()->getName();
-
-        if (!(calledName.equals("CAT_add") || calledName.equals("CAT_sub")))
-          continue;
-
         IRBuilder<> builder(callInst);
         Value *newOperand;
 
@@ -981,7 +984,7 @@ namespace
         }
 
         // check the constantness of the operands
-        auto *constant1 = getIfIsConstant(op1, IN[I]), *constant2 = getIfIsConstant(op2, IN[I]);
+        auto *constant1 = getIfIsConstant(op1, IN[callInst]), *constant2 = getIfIsConstant(op2, IN[callInst]);
         if (!constant1 && !constant2)
           continue;
 
@@ -1009,22 +1012,23 @@ namespace
     bool constantProp()
     {
       std::vector<CallInst *> deleteList;
-      std::vector<Instruction *> instructions;
+      std::vector<CallInst *> instructions;
       for (auto &B : curFunc->getBasicBlockList())
         for (auto &I : B)
-          instructions.push_back(&I);
+        {
+          if (!isa<CallInst>(I))
+            continue;
+          auto *callInst = cast<CallInst>(&I);
+          auto calledName = callInst->getCalledFunction()->getName();
 
-      for (auto *I : instructions)
+          if (!calledName.equals("CAT_get"))
+            continue;
+          instructions.push_back(callInst);
+        }
+
+      for (auto *callInst : instructions)
       {
-        if (!isa<CallInst>(I))
-          continue;
-        auto *callInst = cast<CallInst>(I);
-        auto calledName = callInst->getCalledFunction()->getName();
-
-        if (!calledName.equals("CAT_get"))
-          continue;
-
-        auto *constant = getIfIsConstant(callInst->getOperand(0), IN[I]);
+        auto *constant = getIfIsConstant(callInst->getOperand(0), IN[callInst]);
         if (!constant)
           continue;
 
