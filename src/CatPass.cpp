@@ -23,8 +23,6 @@ namespace
   typedef std::map<Instruction *, AliasSet> AliasMap;
   typedef std::unordered_set<Value *> EscapeSet;
   typedef std::map<Instruction *, EscapeSet> EscapeMap;
-  typedef std::map<Value *, Value *> CacheSet;
-  typedef std::map<Instruction *, CacheSet> CacheMap;
   typedef std::map<Instruction *, bool> DCEMap;
 
   struct CAT : public FunctionPass
@@ -37,7 +35,6 @@ namespace
     RDAMap IN, OUT;
     AliasMap aliIN, aliOUT;
     EscapeMap escIN, escOUT;
-    CacheMap cacheIN, cacheOUT;
 
     Function *curFunc;
     Module *curModule;
@@ -58,14 +55,11 @@ namespace
       curAliOUT[v].insert(v);
     }
 
-    void addDef(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT, CacheSet &curCacheOUT)
+    void addDef(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT)
     {
       curOUT[v].clear();
       for (auto *alias : aliases[v])
-      {
         curOUT[alias].insert(def);
-        curCacheOUT[alias] = NO_CACHE;
-      }
     }
 
     bool RDAinBB(BasicBlock &BB)
@@ -73,7 +67,6 @@ namespace
       RDASet curIN, curOUT;
       AliasSet curAliIN, curAliOUT;
       EscapeSet curEscIN, curEscOUT;
-      CacheSet curCacheIN, curCacheOUT;
       // create two temporary sets for comparing old OUT and new OUT
       std::unordered_set<Instruction *> oldOut, newOut;
       bool firstTime = true;
@@ -122,8 +115,6 @@ namespace
         curAliOUT = curAliIN;
         escIN[&I] = curEscIN;
         curEscOUT = curEscIN;
-        cacheIN[&I] = curCacheIN;
-        curCacheOUT = curCacheIN;
 
         // PHI
         if (I.getType()->isPointerTy() && isa<PHINode>(I))
@@ -197,8 +188,6 @@ namespace
           // clear RDA info and aliasing information
           resetAliasInfo(loadInst, curAliIN, curAliOUT);
           curOUT[loadInst].clear();
-          curEscOUT.insert(loadInst);
-          curEscIN.insert(loadInst);
           // merge RDA info and aliasing information
           for (auto *v : curEscIN)
           {
@@ -209,6 +198,8 @@ namespace
             }
             curOUT[loadInst].insert(curIN[v].begin(), curIN[v].end());
           }
+          // the loaded value is also escaped
+          curEscOUT.insert(loadInst);
         }
         // assignment to CAT_data
         else if (auto *callInst = dyn_cast<CallInst>(&I))
@@ -220,38 +211,32 @@ namespace
             gen = callInst;
             // reset the aliasing information
             resetAliasInfo(gen, curAliIN, curAliOUT);
-            addDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
+            addDef(gen, callInst, curAliOUT, curOUT);
           }
           else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
           {
             gen = callInst->getArgOperand(0);
-            addDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
+            addDef(gen, callInst, curAliOUT, curOUT);
           }
-          else if (calledName.equals("CAT_get"))
-          {
-            auto *data = callInst->getArgOperand(0);
-            // keep the earliest CAT_get as cache
-            if (curCacheOUT[data] == NO_CACHE)
-              curCacheOUT[data] = callInst;
-          }
-          else if (!calledName.equals("CAT_destroy") && !calledName.equals("printf") && !calledName.startswith("llvm.lifetime"))
+          else if (!calledName.equals("CAT_get") && !calledName.equals("CAT_destroy") && !calledName.equals("printf") && !calledName.startswith("llvm.lifetime"))
           {
             // dealing with references that are passed into functions
-            for (auto &op : callInst->operands())
+            for (unsigned i = 0; i < callInst->getNumOperands() - 1; i++)
             {
-              if (!op->getType()->isPointerTy())
+              auto *arg = callInst->getArgOperand(i);
+              if (!arg->getType()->isPointerTy())
                 continue;
 
-              if (curIN.find(op) != curIN.end())
+              if (curIN.find(arg) != curIN.end())
               {
                 // escape the value
-                curEscOUT.insert(op);
-                addDef(op, callInst, curAliIN, curOUT, curCacheOUT);
+                curEscOUT.insert(arg);
+                addDef(arg, callInst, curAliIN, curOUT);
               }
             }
 
             for (auto *v : curEscIN)
-              addDef(v, callInst, curAliIN, curOUT, curCacheOUT);
+              addDef(v, callInst, curAliIN, curOUT);
 
             // if the function returns a pointer, then we consider it as the alias of all escaped values
             // it may also be escaped
@@ -265,7 +250,7 @@ namespace
                 curAliOUT[v].insert(gen);
               }
               curEscOUT.insert(gen);
-              addDef(gen, callInst, curAliOUT, curOUT, curCacheOUT);
+              addDef(gen, callInst, curAliOUT, curOUT);
             }
           }
         }
@@ -276,8 +261,6 @@ namespace
         curAliIN = curAliOUT;
         escOUT[&I] = curEscOUT;
         curEscIN = curEscOUT;
-        cacheOUT[&I] = curCacheOUT;
-        curCacheIN = curCacheOUT;
       }
 
       // if the block is analyzed for the first time, then we need to add its successors to the queue
@@ -452,21 +435,10 @@ namespace
 
         // first check if the data is constant
         // if it is then we don't need to check the cache
-        if (constant)
-        {
-          callInst->replaceAllUsesWith(constant);
-          deleteList.push_back(callInst);
-          continue;
-        }
-
-        // if the data is already got and not modified, reuse
-        // only when the data is not constant, we try reuse it
-        // because only under this condition we can make sure the cache is not deleted
-        auto *cache = cacheIN[I][callInst->getOperand(0)];
-        if (cache == NO_CACHE)
+        if (!constant)
           continue;
 
-        callInst->replaceAllUsesWith(cache);
+        callInst->replaceAllUsesWith(constant);
         deleteList.push_back(callInst);
       }
 
@@ -476,7 +448,7 @@ namespace
       return deleteList.size() > 0;
     }
 
-    bool duplicateConstant(Function &F, RDAMap &IN)
+    bool consecSetEli(Function &F, RDAMap &IN)
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
@@ -484,7 +456,7 @@ namespace
         for (auto &I : B)
           instructions.push_back(&I);
 
-      for (int i = 0; i < instructions.size() - 1; ++i)
+      for (unsigned long i = 0; i < instructions.size() - 1; i++)
       {
         auto *I = instructions[i];
         if (!isa<CallInst>(I) || !isa<CallInst>(instructions[i + 1]))
@@ -501,9 +473,7 @@ namespace
           continue;
 
         if (callInst1->getOperand(0) == callInst2->getOperand(0))
-        {
           deleteList.push_back(callInst1);
-        }
       }
 
       for (auto I : deleteList)
@@ -511,7 +481,8 @@ namespace
 
       return deleteList.size() > 0;
     }
-        bool deadCodeEli(Function &F, RDAMap &IN)
+
+    bool deadCodeEli(Function &F, RDAMap &IN)
     {
       std::vector<CallInst *> deleteList;
       std::vector<Instruction *> instructions;
@@ -525,30 +496,31 @@ namespace
         {
           instructions.push_back(&I);
           if (!isa<CallInst>(I))
-          {
-
             continue;
-          }
 
           auto *callInst = cast<CallInst>(&I);
           auto calledName = callInst->getCalledFunction()->getName();
           // register the call instruction if it is a CAT_add, CAT_sub or CAT_set, which may be deleted by DCE
-          // DCE won't eliminate CAT_new and CAT_get
-          // DCE won't eliminate CAT_add, CAT_sub and CAT_set if the first operand is an argument
-
-          if ((calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set")) && !isa<Argument>(callInst->getArgOperand(0)))
-          {
+          if ((calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set")) &&
+              !isa<Argument>(callInst->getArgOperand(0)) &&
+              escIN[&I].find(callInst->getArgOperand(0)) == escIN[&I].end())
             dceMap[callInst] = false;
-            if (escIN[&I].find(callInst->getArgOperand(0)) != escIN[&I].end())
-            {
-              dceMap[callInst] = true;
-              // continue;
-            }
-          }
         }
 
       for (auto *I : instructions)
       {
+
+        if (isa<ReturnInst>(I))
+        {
+          // if return void, then no need to check the return value
+          if (I->getNumOperands() == 0)
+            continue;
+          // mark the def of the return value as alive
+          for (auto *def : IN[I][I->getOperand(0)])
+            if (dceMap.find(def) != dceMap.end())
+              dceMap[def] = true;
+        }
+
         // check dependencies of the call instruction if it's a CAT_add, CAT_sub or CAT_get
         if (!isa<CallInst>(I))
           continue;
@@ -565,10 +537,6 @@ namespace
           for (auto *def : IN[I][op2])
             if (dceMap.find(def) != dceMap.end())
               dceMap[def] = true;
-          for (auto *op : escIN[I])
-            for (auto *def : IN[I][op])
-              if (dceMap.find(def) != dceMap.end())
-                dceMap[def] = true;
         }
         else if (calledName.equals("CAT_get"))
         {
@@ -576,8 +544,25 @@ namespace
             if (dceMap.find(def) != dceMap.end())
               dceMap[def] = true;
         }
-        else
-          continue;
+        else if (!calledName.equals("CAT_set") &&
+                 !calledName.equals("CAT_new") &&
+                 !calledName.equals("CAT_destroy") &&
+                 !calledName.equals("printf") &&
+                 !calledName.startswith("llvm.lifetime") &&
+                 !calledName.equals("puts"))
+        {
+          // misc function call
+          // mark the def of the arguments and all the escaped values as alive
+          for (auto *op : escIN[I])
+            for (auto *def : IN[I][op])
+              if (dceMap.find(def) != dceMap.end())
+                dceMap[def] = true;
+
+          for (auto &op : callInst->operands())
+            for (auto *def : IN[I][op])
+              if (dceMap.find(def) != dceMap.end())
+                dceMap[def] = true;
+        }
       }
 
       bool changed = false;
@@ -588,11 +573,16 @@ namespace
           changed = true;
           pair.first->eraseFromParent();
         }
+
+      if (!changed)
+        changed |= consecSetEli(F, IN);
+
       return changed;
-        }
-        // This function is invoked once per function compiled
-        // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
-        bool runOnFunction(Function &F) override
+    }
+
+    // This function is invoked once per function compiled
+    // The LLVM IR of the input functions is ready and it can be analyzed and/or transformed
+    bool runOnFunction(Function &F) override
     {
       curFunc = &F;
       std::queue<BasicBlock *> toBeAnalyzed;
@@ -620,10 +610,10 @@ namespace
 
       changed |= constantFoldAndAlgSimp();
       changed |= constantProp();
+
+      // only do DCE when no constant folding or propagation is done
       if (!changed)
         changed |= deadCodeEli(F, IN);
-      if (!changed)
-        changed |= duplicateConstant(F, IN);
 
       return changed;
     }
