@@ -386,49 +386,48 @@ namespace
       return allCATData.size() != oldDataSize || allCATPtr.size() != oldPtrSize;
     }
 
-    enum InstType
-    {
-      PHI,
-      SELECT,
-      ALLOCA,
-      STORE,
-      LOAD,
-      BITCAST,
-      CAT_NEW,
-      CAT_MOD,
-      MISC_FUNC,
-      IGNORED
-    };
+    // enum InstType
+    // {
+    //   PHI,
+    //   SELECT,
+    //   ALLOCA,
+    //   STORE,
+    //   LOAD,
+    //   BITCAST,
+    //   CAT_NEW,
+    //   CAT_MOD,
+    //   MISC_FUNC,
+    //   IGNORED
+    // };
 
-    InstType getInstType(Instruction &I)
-    {
-      cout << "  " << I << "\n";
-      if (auto *callInst = dyn_cast<CallInst>(&I))
-      {
-        auto calledName = callInst->getCalledFunction()->getName();
-        if (ignoredFuncs.find(calledName.str()) != ignoredFuncs.end() || calledName.startswith("llvm.lifetime"))
-          return IGNORED;
-        else if (calledName.equals("CAT_new"))
-          return CAT_NEW;
-        else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
-          return CAT_MOD;
-        else
-          return MISC_FUNC;
-      }
-      else if (I.getType()->isPointerTy() && isa<PHINode>(&I))
-        return PHI;
-      else if (I.getType()->isPointerTy() && isa<SelectInst>(&I))
-        return SELECT;
-      else if (isa<AllocaInst>(&I))
-        return ALLOCA;
-      else if (isa<StoreInst>(&I))
-        return STORE;
-      else if (I.getType()->isPointerTy() && isa<LoadInst>(&I))
-        return LOAD;
-      else if (isa<BitCastInst>(&I))
-        return BITCAST;
-      return IGNORED;
-    }
+    // InstType getInstType(Instruction &I)
+    // {
+    //   if (auto *callInst = dyn_cast<CallInst>(&I))
+    //   {
+    //     auto calledName = callInst->getCalledFunction()->getName();
+    //     if (calledName.equals("CAT_new"))
+    //       return CAT_NEW;
+    //     else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
+    //       return CAT_MOD;
+    //     else if (ignoredFuncs.find(calledName.str()) == ignoredFuncs.end() && !calledName.startswith("llvm.lifetime"))
+    //       return MISC_FUNC;
+    //     else
+    //       return IGNORED;
+    //   }
+    //   else if (I.getType()->isPointerTy() && isa<PHINode>(I))
+    //     return PHI;
+    //   else if (I.getType()->isPointerTy() && isa<SelectInst>(I))
+    //     return SELECT;
+    //   else if (isa<AllocaInst>(I))
+    //     return ALLOCA;
+    //   else if (isa<StoreInst>(I))
+    //     return STORE;
+    //   else if (I.getType()->isPointerTy() && isa<LoadInst>(I))
+    //     return LOAD;
+    //   else if (isa<BitCastInst>(I))
+    //     return BITCAST;
+    //   return IGNORED;
+    // }
 
     bool RDAinBB(BasicBlock &BB)
     {
@@ -501,7 +500,7 @@ namespace
       // calculate IN and OUT for each instruction in the current block
       for (auto &I : BB)
       {
-        auto type = getInstType(I);
+        // auto type = getInstType(I);
         // if (type == IGNORED)
         //   continue;
 
@@ -512,9 +511,8 @@ namespace
         ptIN[&I] = curPtIN;
         curPtOUT = curPtIN;
 
-        switch (type)
-        {
-        case PHI:
+        // PHI
+        if (I.getType()->isPointerTy() && isa<PHINode>(I))
         {
           // aliasing/multiple definition may be happening
           // for now we only consider the case where the definition is a pointer (CAT are all pointers)
@@ -565,8 +563,8 @@ namespace
             break;
           }
         }
-        break;
-        case SELECT:
+        // SELECT
+        else if (I.getType()->isPointerTy() && isa<SelectInst>(I))
         {
           auto *selectInst = cast<SelectInst>(&I);
           auto *op1 = selectInst->getOperand(1), *op2 = selectInst->getOperand(2);
@@ -595,10 +593,9 @@ namespace
             break;
           }
         }
-        break;
-        case ALLOCA:
+        // ALLOCA
+        else if (auto *allocaInst = dyn_cast<AllocaInst>(&I))
         {
-          auto *allocaInst = cast<AllocaInst>(&I);
           if (checkType(allocaInst) == CAT_PTR)
           {
             resetAliasInfo(allocaInst, curAliIN, curAliOUT);
@@ -607,10 +604,9 @@ namespace
           else
             cout << "[WARNING] In " << *allocaInst << " the ptr is not recognized\n";
         }
-        break;
-        case STORE:
+        // STORE
+        else if (auto *storeInst = dyn_cast<StoreInst>(&I))
         {
-          auto *storeInst = cast<StoreInst>(&I);
           auto *ptr = storeInst->getPointerOperand();
           auto *value = storeInst->getValueOperand();
           if (checkType(ptr) == CAT_PTR)
@@ -618,8 +614,8 @@ namespace
           else
             cout << "[WARNING] In " << *storeInst << " the ptr is not recognized\n";
         }
-        break;
-        case LOAD:
+        // LOAD
+        else if (I.getType()->isPointerTy() && isa<LoadInst>(&I))
         {
           auto *loadInst = cast<LoadInst>(&I);
           auto *ptr = loadInst->getPointerOperand();
@@ -672,10 +668,9 @@ namespace
           else
             cout << "[WARNING] In " << *loadInst << " the ptr is not recognized\n";
         }
-        break;
-        case BITCAST:
+        // BITCAST: add alias info
+        else if (auto *bitcastInst = dyn_cast<BitCastInst>(&I))
         {
-          auto *bitcastInst = cast<BitCastInst>(&I);
           auto *casted = bitcastInst->getOperand(0);
           resetAliasInfo(bitcastInst, curAliIN, curAliOUT);
           for (auto *alias : curAliIN[casted])
@@ -697,126 +692,122 @@ namespace
             break;
           }
         }
-        break;
-        case CAT_NEW:
+        // CAT OP: changes RDA of the first operand
+        else if (auto *callInst = dyn_cast<CallInst>(&I))
         {
-          auto *newInst = cast<CallInst>(&I);
-          // reset the aliasing information
-          resetAliasInfo(newInst, curAliIN, curAliOUT);
-          setDef(newInst, newInst, curAliOUT, curOUT);
-        }
-        break;
-        case CAT_MOD:
-        {
-          auto *modInst = cast<CallInst>(&I);
-          Value *gen = modInst->getArgOperand(0);
-          setDef(gen, modInst, curAliOUT, curOUT);
-        }
-        break;
-        case MISC_FUNC:
-        {
-          auto *callInst = cast<CallInst>(&I);
-          std::set<Value *> possibleDataPassedIn, possiblePtrPassedIn, possiblePtrModified;
-
-          // add globals
-          for (auto &GV : curModule->globals())
-            switch (checkType(&GV))
-            {
-            case CAT_DATA:
-              possibleDataPassedIn.insert(&GV);
-              break;
-            case OTHER:
-              break;
-            case CAT_PTR:
-              possiblePtrPassedIn.insert(&GV);
-              if (mayReferencedByFunc(callInst, &GV))
-              {
-                auto possibleCATData = findAllPossibleCATData(&GV, curPtIN);
-                possibleDataPassedIn.insert(possibleCATData.begin(), possibleCATData.end());
-              }
-              break;
-            }
-
-          for (unsigned i = 0; i < callInst->getNumOperands() - 1; i++)
+          auto calledName = callInst->getCalledFunction()->getName();
+          if (calledName.equals("CAT_new"))
           {
-            auto *arg = callInst->getArgOperand(i);
-            switch (checkType(arg))
-            {
-            case CAT_DATA:
-              possibleDataPassedIn.insert(arg);
-              break;
-            case OTHER:
-              break;
-            case CAT_PTR:
-              possiblePtrPassedIn.insert(arg);
-              if (mayReferencedByFunc(callInst, arg))
-              {
-                auto possibleCATData = findAllPossibleCATData(arg, curPtIN);
-                possibleDataPassedIn.insert(possibleCATData.begin(), possibleCATData.end());
-              }
-              break;
-            }
+            // reset the aliasing information
+            resetAliasInfo(callInst, curAliIN, curAliOUT);
+            setDef(callInst, callInst, curAliOUT, curOUT);
           }
-
-          for (auto *ptr : possiblePtrPassedIn)
-            if (mayModifiedByFunc(callInst, ptr))
-              possiblePtrModified.insert(ptr);
-
-          for (auto *data : possibleDataPassedIn)
-            if (data == UNKNOWN)
-              continue;
-            else if (mayModifiedByFunc(callInst, data))
-              setDef(data, UNKNOWN, curAliIN, curOUT);
-
-          // modified PTR can point to any passed in DATA
-          for (auto *ptr : possiblePtrModified)
-            for (auto *data : possibleDataPassedIn)
-              addPointTo(ptr, data, curAliIN, curPtOUT);
-
-          // the return value can be alias of any same-level argument
-          switch (checkType(callInst))
+          else if (calledName.equals("CAT_add") || calledName.equals("CAT_sub") || calledName.equals("CAT_set"))
           {
-          case CAT_DATA:
-            // merge all info of possible CAT_data
-            resetAliasInfo(callInst, curAliIN, curAliOUT);
-            curOUT[callInst].clear();
+            Value *gen = callInst->getArgOperand(0);
+            setDef(gen, callInst, curAliOUT, curOUT);
+          }
+          // MISC FUNC
+          else if (ignoredFuncs.find(calledName.str()) == ignoredFuncs.end() && !calledName.startswith("llvm.lifetime"))
+          {
+            std::set<Value *> possibleDataPassedIn, possiblePtrPassedIn, possiblePtrModified;
 
-            // it could be pointed by any possible CAT_ptr modified
-            for (auto *ptr : possiblePtrModified)
-              curPtOUT[ptr].insert(callInst);
-
-            for (auto *data : possibleDataPassedIn)
-            {
-              if (data == UNKNOWN)
-                curOUT[callInst].insert(UNKNOWN);
-              else if (AA->alias(data, getSize(data), callInst, getSize(callInst)) == AliasResult::NoAlias)
-                continue;
-              else
+            // add globals
+            for (auto &GV : curModule->globals())
+              switch (checkType(&GV))
               {
-                curOUT[callInst].insert(curOUT[data].begin(), curOUT[data].end());
-                mergeAliasInfo(data, callInst, curAliIN, curAliOUT);
+              case CAT_DATA:
+                possibleDataPassedIn.insert(&GV);
+                break;
+              case OTHER:
+                break;
+              case CAT_PTR:
+                possiblePtrPassedIn.insert(&GV);
+                if (mayReferencedByFunc(callInst, &GV))
+                {
+                  auto possibleCATData = findAllPossibleCATData(&GV, curPtIN);
+                  possibleDataPassedIn.insert(possibleCATData.begin(), possibleCATData.end());
+                }
+                break;
+              }
+
+            for (unsigned i = 0; i < callInst->getNumOperands() - 1; i++)
+            {
+              auto *arg = callInst->getArgOperand(i);
+              switch (checkType(arg))
+              {
+              case CAT_DATA:
+                possibleDataPassedIn.insert(arg);
+                break;
+              case OTHER:
+                break;
+              case CAT_PTR:
+                possiblePtrPassedIn.insert(arg);
+                if (mayReferencedByFunc(callInst, arg))
+                {
+                  auto possibleCATData = findAllPossibleCATData(arg, curPtIN);
+                  possibleDataPassedIn.insert(possibleCATData.begin(), possibleCATData.end());
+                }
+                break;
               }
             }
-            break;
-          case CAT_PTR:
-            // merge all info of possible CAT_ptr
-            resetAliasInfo(callInst, curAliIN, curAliOUT);
-            curPtOUT[callInst].clear();
+
             for (auto *ptr : possiblePtrPassedIn)
-            {
-              if (AA->alias(ptr, getSize(ptr), callInst, getSize(callInst)) == AliasResult::NoAlias)
+              if (mayModifiedByFunc(callInst, ptr))
+                possiblePtrModified.insert(ptr);
+
+            for (auto *data : possibleDataPassedIn)
+              if (data == UNKNOWN)
                 continue;
-              curPtOUT[callInst].insert(curPtOUT[ptr].begin(), curPtOUT[ptr].end());
-              mergeAliasInfo(ptr, callInst, curAliIN, curAliOUT);
+              else if (mayModifiedByFunc(callInst, data))
+                setDef(data, UNKNOWN, curAliIN, curOUT);
+
+            // modified PTR can point to any passed in DATA
+            for (auto *ptr : possiblePtrModified)
+              for (auto *data : possibleDataPassedIn)
+                addPointTo(ptr, data, curAliIN, curPtOUT);
+
+            // the return value can be alias of any same-level argument
+            switch (checkType(callInst))
+            {
+            case CAT_DATA:
+              // merge all info of possible CAT_data
+              resetAliasInfo(callInst, curAliIN, curAliOUT);
+              curOUT[callInst].clear();
+
+              // it could be pointed by any possible CAT_ptr modified
+              for (auto *ptr : possiblePtrModified)
+                curPtOUT[ptr].insert(callInst);
+
+              for (auto *data : possibleDataPassedIn)
+              {
+                if (data == UNKNOWN)
+                  curOUT[callInst].insert(UNKNOWN);
+                else if (AA->alias(data, getSize(data), callInst, getSize(callInst)) == AliasResult::NoAlias)
+                  continue;
+                else
+                {
+                  curOUT[callInst].insert(curOUT[data].begin(), curOUT[data].end());
+                  mergeAliasInfo(data, callInst, curAliIN, curAliOUT);
+                }
+              }
+              break;
+            case CAT_PTR:
+              // merge all info of possible CAT_ptr
+              resetAliasInfo(callInst, curAliIN, curAliOUT);
+              curPtOUT[callInst].clear();
+              for (auto *ptr : possiblePtrPassedIn)
+              {
+                if (AA->alias(ptr, getSize(ptr), callInst, getSize(callInst)) == AliasResult::NoAlias)
+                  continue;
+                curPtOUT[callInst].insert(curPtOUT[ptr].begin(), curPtOUT[ptr].end());
+                mergeAliasInfo(ptr, callInst, curAliIN, curAliOUT);
+              }
+              break;
+            case OTHER:
+              break;
             }
-            break;
-          case OTHER:
-            break;
           }
-        }
-        break;
-        case IGNORED:
-          continue;
         }
 
         OUT[&I] = curOUT;
@@ -848,8 +839,7 @@ namespace
       return false;
     }
 
-    void
-    dumpRDAInfo()
+    void dumpRDAInfo()
     {
       cout << "Function \"" << curFunc->getName() << "\"\n";
 
