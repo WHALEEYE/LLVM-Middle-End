@@ -1065,8 +1065,8 @@ namespace
     bool transformLoops()
     {
       bool changed = false;
-      // only handle loops in function with less than 800 instructions
-      if (curFunc->getInstructionCount() >= 800)
+      // only handle loops in function with less than 500 instructions
+      if (curFunc->getInstructionCount() >= 500)
         return false;
       auto &LI = getAnalysis<LoopInfoWrapperPass>(*curFunc).getLoopInfo();
       auto &DT = getAnalysis<DominatorTreeWrapperPass>(*curFunc).getDomTree();
@@ -1162,7 +1162,7 @@ namespace
         AssumptionCache &AC)
     {
       if (loop->isLoopSimplifyForm() && loop->isLCSSAForm(DT))
-        if (peelLoop(loop, 10, &LI, &SE, DT, &AC, true))
+        if (peelLoop(loop, 2, &LI, &SE, DT, &AC, true))
           return true;
       return false;
     }
