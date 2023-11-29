@@ -36,10 +36,7 @@ namespace
   typedef std::map<Instruction *, RDASet> RDAMap;
   typedef std::map<Value *, std::set<Value *>> AliasSet;
   typedef std::map<Instruction *, AliasSet> AliasMap;
-  typedef std::unordered_set<Value *> EscapeSet;
-  typedef std::map<Instruction *, EscapeSet> EscapeMap;
   typedef std::map<Value *, Value *> CacheSet;
-  typedef std::map<Instruction *, CacheSet> CacheMap;
 
   const std::unordered_set<std::string> ignoredFuncs = {"printf", "puts", "CAT_destroy", "CAT_get", "sqrt"};
   const std::unordered_set<std::string> catApis = {"CAT_new", "CAT_add", "CAT_sub", "CAT_set", "CAT_get", "CAT_destroy"};
@@ -60,8 +57,6 @@ namespace
     // sets for RDA
     RDAMap IN, OUT;
     AliasMap aliIN, aliOUT, ptIN, ptOUT;
-    EscapeMap escIN, escOUT;
-    CacheMap cacheIN, cacheOUT;
     std::set<Value *> allCATData, allCATPtr;
     std::map<Instruction *, Instruction *> deleteMap;
     std::map<Value *, Value *> propMap;
@@ -88,10 +83,6 @@ namespace
       aliOUT.clear();
       ptIN.clear();
       ptOUT.clear();
-      escIN.clear();
-      escOUT.clear();
-      cacheIN.clear();
-      cacheOUT.clear();
       allCATData.clear();
       allCATPtr.clear();
       deleteMap.clear();
@@ -157,7 +148,7 @@ namespace
       curAliOUT[v].insert(v);
     }
 
-    void addDef(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT, CacheSet &curCacheOUT)
+    void addDef(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT)
     {
       if (aliases.find(v) == aliases.end())
       {
@@ -166,16 +157,13 @@ namespace
       }
 
       for (auto *alias : aliases[v])
-      {
         curOUT[alias].insert(def);
-        curCacheOUT[alias] = NO_CACHE;
-      }
     }
 
-    void setDef(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT, CacheSet &curCacheOUT)
+    void setDef(Value *v, Instruction *def, AliasSet &aliases, RDASet &curOUT)
     {
       curOUT[v].clear();
-      addDef(v, def, aliases, curOUT, curCacheOUT);
+      addDef(v, def, aliases, curOUT);
     }
 
     void addPointTo(Value *ptr, Value *val, AliasSet &aliases, AliasSet &curPtOUT)
@@ -427,7 +415,7 @@ namespace
         else
           return MISC_FUNC;
       }
-      if (I.getType()->isPointerTy() && isa<PHINode>(&I))
+      else if (I.getType()->isPointerTy() && isa<PHINode>(&I))
         return PHI;
       else if (I.getType()->isPointerTy() && isa<SelectInst>(&I))
         return SELECT;
@@ -446,8 +434,6 @@ namespace
     {
       RDASet curIN, curOUT;
       AliasSet curAliIN, curAliOUT, curPtIN, curPtOUT;
-      EscapeSet curEscIN, curEscOUT;
-      CacheSet curCacheIN, curCacheOUT;
       // create two temporary sets for comparing old OUT and new OUT
       std::unordered_set<Instruction *> oldOut, newOut;
       bool firstTime = true;
@@ -473,10 +459,6 @@ namespace
           for (auto &pair : ptOUT[PB->getTerminator()])
             for (auto *I : pair.second)
               curPtIN[pair.first].insert(I);
-
-          // merge the escape information
-          auto &predEscOUT = escOUT[PB->getTerminator()];
-          curEscIN.insert(predEscOUT.begin(), predEscOUT.end());
         }
       else
       {
@@ -520,8 +502,8 @@ namespace
       for (auto &I : BB)
       {
         auto type = getInstType(I);
-        if (type == IGNORED)
-          continue;
+        // if (type == IGNORED)
+        //   continue;
 
         IN[&I] = curIN;
         curOUT = curIN;
@@ -529,10 +511,6 @@ namespace
         curAliOUT = curAliIN;
         ptIN[&I] = curPtIN;
         curPtOUT = curPtIN;
-        escIN[&I] = curEscIN;
-        curEscOUT = curEscIN;
-        cacheIN[&I] = curCacheIN;
-        curCacheOUT = curCacheIN;
 
         switch (type)
         {
@@ -586,8 +564,8 @@ namespace
           case OTHER:
             break;
           }
-          break;
         }
+        break;
         case SELECT:
         {
           auto *selectInst = cast<SelectInst>(&I);
@@ -616,8 +594,8 @@ namespace
           case OTHER:
             break;
           }
-          break;
         }
+        break;
         case ALLOCA:
         {
           auto *allocaInst = cast<AllocaInst>(&I);
@@ -628,8 +606,8 @@ namespace
           }
           else
             cout << "[WARNING] In " << *allocaInst << " the ptr is not recognized\n";
-          break;
         }
+        break;
         case STORE:
         {
           auto *storeInst = cast<StoreInst>(&I);
@@ -639,8 +617,8 @@ namespace
             setPointTo(ptr, value, curAliIN, curPtOUT);
           else
             cout << "[WARNING] In " << *storeInst << " the ptr is not recognized\n";
-          break;
         }
+        break;
         case LOAD:
         {
           auto *loadInst = cast<LoadInst>(&I);
@@ -693,8 +671,8 @@ namespace
           }
           else
             cout << "[WARNING] In " << *loadInst << " the ptr is not recognized\n";
-          break;
         }
+        break;
         case BITCAST:
         {
           auto *bitcastInst = cast<BitCastInst>(&I);
@@ -718,23 +696,23 @@ namespace
           case OTHER:
             break;
           }
-          break;
         }
+        break;
         case CAT_NEW:
         {
           auto *newInst = cast<CallInst>(&I);
           // reset the aliasing information
           resetAliasInfo(newInst, curAliIN, curAliOUT);
-          setDef(newInst, newInst, curAliOUT, curOUT, curCacheOUT);
-          break;
+          setDef(newInst, newInst, curAliOUT, curOUT);
         }
+        break;
         case CAT_MOD:
         {
           auto *modInst = cast<CallInst>(&I);
           Value *gen = modInst->getArgOperand(0);
-          setDef(gen, modInst, curAliOUT, curOUT, curCacheOUT);
-          break;
+          setDef(gen, modInst, curAliOUT, curOUT);
         }
+        break;
         case MISC_FUNC:
         {
           auto *callInst = cast<CallInst>(&I);
@@ -788,7 +766,7 @@ namespace
             if (data == UNKNOWN)
               continue;
             else if (mayModifiedByFunc(callInst, data))
-              setDef(data, UNKNOWN, curAliIN, curOUT, curCacheOUT);
+              setDef(data, UNKNOWN, curAliIN, curOUT);
 
           // modified PTR can point to any passed in DATA
           for (auto *ptr : possiblePtrModified)
@@ -835,8 +813,8 @@ namespace
           case OTHER:
             break;
           }
-          break;
         }
+        break;
         case IGNORED:
           continue;
         }
@@ -847,10 +825,6 @@ namespace
         curAliIN = curAliOUT;
         ptOUT[&I] = curPtOUT;
         curPtIN = curPtOUT;
-        escOUT[&I] = curEscOUT;
-        curEscIN = curEscOUT;
-        cacheOUT[&I] = curCacheOUT;
-        curCacheIN = curCacheOUT;
       }
 
       // if the block is analyzed for the first time, then we need to add its successors to the queue
